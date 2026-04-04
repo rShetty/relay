@@ -237,13 +237,17 @@ class DatabaseOAuthProvider(OAuthProvider):
             "scope": payload.scope,
         }
     
-    def refresh_access_token(self, refresh_token: str) -> Optional["TokenPair"]:
+    def refresh_access_token(self, refresh_token: str, client_id: Optional[str] = None) -> Optional[TokenPair]:
         """Refresh access token."""
         payload = self.jwt.decode_token(refresh_token)
         if not payload:
             return None
         
         if db.is_token_revoked(payload.jti):
+            return None
+        
+        if client_id and payload.client_id != client_id:
+            logger.warning(f"Client ID mismatch in refresh token")
             return None
         
         return self._create_token_pair(
