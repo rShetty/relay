@@ -154,6 +154,49 @@ def init_db() -> sqlite3.Connection:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(user_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_api_keys_active ON api_keys(is_active)")
     
+    # Add is_admin column to users if not exists
+    try:
+        conn.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+    
+    # Connector Permissions (granular tool access per user)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS connector_permissions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            connector_name TEXT NOT NULL,
+            tools TEXT NOT NULL,  -- JSON array of allowed tool names, or null for all
+            is_default INTEGER DEFAULT 0,  -- 1 if this is a default permission for new users
+            created_by TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(user_id, connector_name)
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_conn_perms_user ON connector_permissions(user_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_conn_perms_connector ON connector_permissions(connector_name)")
+    
+    # Access Requests (user requests for connector access)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS access_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            connector_name TEXT NOT NULL,
+            requested_tools TEXT,  -- JSON array of requested tools, null for all
+            reason TEXT,
+            status TEXT DEFAULT 'pending',  -- pending, approved, rejected
+            requested_at TEXT NOT NULL,
+            reviewed_by TEXT,
+            reviewed_at TEXT,
+            review_note TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_access_req_user ON access_requests(user_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_access_req_status ON access_requests(status)")
+    
     conn.commit()
     logger.info(f"Database initialized at {get_db_path()}")
     
@@ -459,21 +502,35 @@ def create_user(
     username: str,
     hashed_password: str,
     email: Optional[str] = None,
+    is_admin: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Create a new user. Returns None if username or email already exists."""
     conn = get_connection()
     now = datetime.now(timezone.utc).isoformat()
     try:
         conn.execute("""
-            INSERT INTO users (id, username, email, hashed_password, is_active, created_at, updated_at)
-            VALUES (?, ?, ?, ?, 1, ?, ?)
-        """, (user_id, username, email, hashed_password, now, now))
+            INSERT INTO users (id, username, email, hashed_password, is_active, is_admin, created_at, updated_at)
+            VALUES (?, ?, ?, ?, 1, ?, ?, ?)
+        """, (user_id, username, email, hashed_password, 1 if is_admin else 0, now, now))
+        
+        # Apply default permissions for non-admin users
+        if not is_admin:
+            defaults = get_default_permissions()
+            for perm in defaults:
+                tools_json = json.dumps(perm.get("tools")) if perm.get("tools") else None
+                conn.execute("""
+                    INSERT OR IGNORE INTO connector_permissions 
+                    (user_id, connector_name, tools, is_default, created_at, updated_at)
+                    VALUES (?, ?, ?, 1, ?, ?)
+                """, (user_id, perm["connector_name"], tools_json, now, now))
+        
         conn.commit()
         return {
             "id": user_id,
             "username": username,
             "email": email,
             "is_active": True,
+            "is_admin": is_admin,
         }
     except sqlite3.IntegrityError:
         return None
@@ -500,7 +557,7 @@ def get_user_by_id(user_id: str) -> Optional[Dict[str, Any]]:
     """Get user by ID."""
     conn = get_connection()
     row = conn.execute(
-        "SELECT id, username, email, is_active, created_at FROM users WHERE id = ?", (user_id,)
+        "SELECT id, username, email, is_active, is_admin, created_at FROM users WHERE id = ?", (user_id,)
     ).fetchone()
     if not row:
         return None
@@ -509,6 +566,7 @@ def get_user_by_id(user_id: str) -> Optional[Dict[str, Any]]:
         "username": row["username"],
         "email": row["email"],
         "is_active": bool(row["is_active"]),
+        "is_admin": bool(row.get("is_admin", 0)),
         "created_at": row["created_at"],
     }
 
@@ -682,3 +740,363 @@ def update_api_key_last_used(key: str) -> None:
     now = datetime.now(timezone.utc).isoformat()
     conn.execute("UPDATE api_keys SET last_used_at = ? WHERE key = ?", (now, key))
     conn.commit()
+
+
+# -----------------------------------------------------------------------------
+# User Admin Functions
+# -----------------------------------------------------------------------------
+
+def set_user_admin(user_id: str, is_admin: bool = True) -> bool:
+    """Set or unset user as admin."""
+    conn = get_connection()
+    now = datetime.now(timezone.utc).isoformat()
+    cursor = conn.execute(
+        "UPDATE users SET is_admin = ?, updated_at = ? WHERE id = ?",
+        (1 if is_admin else 0, now, user_id)
+    )
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def is_user_admin(user_id: str) -> bool:
+    """Check if user is an admin."""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT is_admin FROM users WHERE id = ?", (user_id,)
+    ).fetchone()
+    return row and bool(row["is_admin"])
+
+
+def list_users(is_admin: Optional[bool] = None) -> List[Dict[str, Any]]:
+    """List all users, optionally filter by admin status."""
+    conn = get_connection()
+    if is_admin is None:
+        rows = conn.execute(
+            "SELECT id, username, email, is_active, is_admin, created_at FROM users ORDER BY created_at DESC"
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id, username, email, is_active, is_admin, created_at FROM users WHERE is_admin = ? ORDER BY created_at DESC",
+            (1 if is_admin else 0,)
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+# -----------------------------------------------------------------------------
+# Connector Permissions (Granular Tool Access)
+# -----------------------------------------------------------------------------
+
+def set_connector_permission(
+    user_id: str,
+    connector_name: str,
+    tools: Optional[List[str]] = None,
+    is_default: bool = False,
+    created_by: Optional[str] = None,
+) -> None:
+    """Set or update connector permission for a user."""
+    conn = get_connection()
+    now = datetime.now(timezone.utc).isoformat()
+    tools_json = json.dumps(tools) if tools else None
+    
+    conn.execute("""
+        INSERT OR REPLACE INTO connector_permissions 
+        (user_id, connector_name, tools, is_default, created_by, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (user_id, connector_name, tools_json, 1 if is_default else 0, created_by, now, now))
+    conn.commit()
+
+
+def get_connector_permission(user_id: str, connector_name: str) -> Optional[Dict[str, Any]]:
+    """Get connector permission for a user."""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT * FROM connector_permissions WHERE user_id = ? AND connector_name = ?",
+        (user_id, connector_name)
+    ).fetchone()
+    if not row:
+        return None
+    return {
+        "user_id": row["user_id"],
+        "connector_name": row["connector_name"],
+        "tools": json.loads(row["tools"]) if row["tools"] else None,
+        "is_default": bool(row["is_default"]),
+        "created_by": row["created_by"],
+        "created_at": row["created_at"],
+    }
+
+
+def get_user_permissions(user_id: str) -> List[Dict[str, Any]]:
+    """Get all connector permissions for a user."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT * FROM connector_permissions WHERE user_id = ?",
+        (user_id,)
+    ).fetchall()
+    return [
+        {
+            "connector_name": row["connector_name"],
+            "tools": json.loads(row["tools"]) if row["tools"] else None,
+            "is_default": bool(row["is_default"]),
+        }
+        for row in rows
+    ]
+
+
+def get_all_user_permissions() -> Dict[str, List[Dict[str, Any]]]:
+    """Get all connector permissions for all users (for admin view)."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT * FROM connector_permissions ORDER BY user_id, connector_name"
+    ).fetchall()
+    
+    result = {}
+    for row in rows:
+        user_id = row["user_id"]
+        if user_id not in result:
+            result[user_id] = []
+        result[user_id].append({
+            "connector_name": row["connector_name"],
+            "tools": json.loads(row["tools"]) if row["tools"] else None,
+            "is_default": bool(row["is_default"]),
+        })
+    return result
+
+
+def get_default_permissions() -> List[Dict[str, Any]]:
+    """Get all default connector permissions."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT * FROM connector_permissions WHERE is_default = 1"
+    ).fetchall()
+    return [
+        {
+            "connector_name": row["connector_name"],
+            "tools": json.loads(row["tools"]) if row["tools"] else None,
+        }
+        for row in rows
+    ]
+
+
+def delete_connector_permission(user_id: str, connector_name: str) -> bool:
+    """Delete connector permission for a user."""
+    conn = get_connection()
+    cursor = conn.execute(
+        "DELETE FROM connector_permissions WHERE user_id = ? AND connector_name = ?",
+        (user_id, connector_name)
+    )
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def apply_default_permissions(user_id: str, created_by: Optional[str] = None) -> None:
+    """Apply default permissions to a new user."""
+    defaults = get_default_permissions()
+    for perm in defaults:
+        set_connector_permission(
+            user_id=user_id,
+            connector_name=perm["connector_name"],
+            tools=perm.get("tools"),
+            is_default=False,
+            created_by=created_by,
+        )
+
+
+# -----------------------------------------------------------------------------
+# Access Requests
+# -----------------------------------------------------------------------------
+
+def create_access_request(
+    user_id: str,
+    connector_name: str,
+    requested_tools: Optional[List[str]] = None,
+    reason: Optional[str] = None,
+) -> int:
+    """Create a new access request. Returns request ID."""
+    conn = get_connection()
+    now = datetime.now(timezone.utc).isoformat()
+    tools_json = json.dumps(requested_tools) if requested_tools else None
+    
+    cursor = conn.execute("""
+        INSERT INTO access_requests 
+        (user_id, connector_name, requested_tools, reason, status, requested_at, created_at, updated_at)
+        VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)
+    """, (user_id, connector_name, tools_json, reason, now, now, now))
+    conn.commit()
+    return cursor.lastrowid
+
+
+def get_access_request(request_id: int) -> Optional[Dict[str, Any]]:
+    """Get access request by ID."""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT * FROM access_requests WHERE id = ?", (request_id,)
+    ).fetchone()
+    if not row:
+        return None
+    return {
+        "id": row["id"],
+        "user_id": row["user_id"],
+        "connector_name": row["connector_name"],
+        "requested_tools": json.loads(row["requested_tools"]) if row["requested_tools"] else None,
+        "reason": row["reason"],
+        "status": row["status"],
+        "requested_at": row["requested_at"],
+        "reviewed_by": row["reviewed_by"],
+        "reviewed_at": row["reviewed_at"],
+        "review_note": row["review_note"],
+    }
+
+
+def get_user_access_requests(user_id: str) -> List[Dict[str, Any]]:
+    """Get all access requests for a user."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT * FROM access_requests WHERE user_id = ? ORDER BY created_at DESC",
+        (user_id,)
+    ).fetchall()
+    return [
+        {
+            "id": row["id"],
+            "connector_name": row["connector_name"],
+            "requested_tools": json.loads(row["requested_tools"]) if row["requested_tools"] else None,
+            "reason": row["reason"],
+            "status": row["status"],
+            "requested_at": row["requested_at"],
+            "reviewed_by": row["reviewed_by"],
+            "reviewed_at": row["reviewed_at"],
+            "review_note": row["review_note"],
+        }
+        for row in rows
+    ]
+
+
+def get_pending_access_requests() -> List[Dict[str, Any]]:
+    """Get all pending access requests."""
+    conn = get_connection()
+    rows = conn.execute(
+        """SELECT ar.*, u.username 
+           FROM access_requests ar 
+           JOIN users u ON ar.user_id = u.id 
+           WHERE ar.status = 'pending' 
+           ORDER BY ar.requested_at DESC"""
+    ).fetchall()
+    return [
+        {
+            "id": row["id"],
+            "user_id": row["user_id"],
+            "username": row["username"],
+            "connector_name": row["connector_name"],
+            "requested_tools": json.loads(row["requested_tools"]) if row["requested_tools"] else None,
+            "reason": row["reason"],
+            "status": row["status"],
+            "requested_at": row["requested_at"],
+        }
+        for row in rows
+    ]
+
+
+def get_all_access_requests(status: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Get all access requests, optionally filter by status."""
+    conn = get_connection()
+    if status:
+        rows = conn.execute(
+            """SELECT ar.*, u.username 
+               FROM access_requests ar 
+               JOIN users u ON ar.user_id = u.id 
+               WHERE ar.status = ? 
+               ORDER BY ar.created_at DESC""",
+            (status,)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """SELECT ar.*, u.username 
+               FROM access_requests ar 
+               JOIN users u ON ar.user_id = u.id 
+               ORDER BY ar.created_at DESC"""
+        ).fetchall()
+    return [
+        {
+            "id": row["id"],
+            "user_id": row["user_id"],
+            "username": row["username"],
+            "connector_name": row["connector_name"],
+            "requested_tools": json.loads(row["requested_tools"]) if row["requested_tools"] else None,
+            "reason": row["reason"],
+            "status": row["status"],
+            "requested_at": row["requested_at"],
+            "reviewed_by": row["reviewed_by"],
+            "reviewed_at": row["reviewed_at"],
+            "review_note": row["review_note"],
+        }
+        for row in rows
+    ]
+
+
+def review_access_request(
+    request_id: int,
+    reviewer_user_id: str,
+    approved: bool,
+    note: Optional[str] = None,
+) -> bool:
+    """Review an access request (approve or reject)."""
+    conn = get_connection()
+    now = datetime.now(timezone.utc).isoformat()
+    status = "approved" if approved else "rejected"
+    
+    cursor = conn.execute("""
+        UPDATE access_requests 
+        SET status = ?, reviewed_by = ?, reviewed_at = ?, review_note = ?, updated_at = ?
+        WHERE id = ?
+    """, (status, reviewer_user_id, now, note, now, request_id))
+    conn.commit()
+    
+    if cursor.rowcount > 0 and approved:
+        # Get the request details to create the permission
+        request = get_access_request(request_id)
+        if request:
+            set_connector_permission(
+                user_id=request["user_id"],
+                connector_name=request["connector_name"],
+                tools=request.get("requested_tools"),
+                created_by=reviewer_user_id,
+            )
+    
+    return cursor.rowcount > 0
+
+
+# -----------------------------------------------------------------------------
+# Access Check Helper
+# -----------------------------------------------------------------------------
+
+def check_user_tool_access(user_id: str, connector_name: str, tool_name: str) -> bool:
+    """
+    Check if a user has access to a specific tool on a connector.
+    
+    Returns True if:
+    - User has permission with tools=None (all tools allowed)
+    - User has permission with tools containing the specific tool
+    - No specific permission exists (allow by default for backward compat)
+    
+    Returns False if:
+    - User has explicit permission that doesn't include the tool
+    """
+    perm = get_connector_permission(user_id, connector_name)
+    
+    # If no permission exists, allow access (backward compatibility)
+    if perm is None:
+        return True
+    
+    # If tools is None or empty, user has access to all tools
+    if perm.get("tools") is None or len(perm.get("tools", [])) == 0:
+        return True
+    
+    # Check if tool is in the allowed list
+    return tool_name in perm["tools"]
+
+
+def get_user_allowed_tools(user_id: str, connector_name: str) -> Optional[List[str]]:
+    """Get list of allowed tools for a user on a connector, or None if all allowed."""
+    perm = get_connector_permission(user_id, connector_name)
+    if perm is None:
+        return None  # All tools allowed
+    return perm.get("tools")

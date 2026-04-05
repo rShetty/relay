@@ -435,6 +435,12 @@ def render_template(name: str, **context) -> HTMLResponse:
     """Render a Jinja2 template."""
     if templates is None:
         return HTMLResponse(content="<h1>Templates not available</h1>", status_code=500)
+    
+    # Always include is_admin in context if not provided
+    if "is_admin" not in context:
+        user = context.get("user")
+        context["is_admin"] = user.get("is_admin", False) if user else False
+    
     template = templates.get_template(name)
     return HTMLResponse(content=template.render(**context))
 
@@ -1208,10 +1214,221 @@ async def settings_page(request: Request):
     if not user:
         return RedirectResponse(url="/auth/login")
     
+    is_admin = user.get("is_admin", False)
+    
     return render_template(
         "settings.html",
         user=user,
+        is_admin=is_admin,
     )
+
+
+# -----------------------------------------------------------------------------
+# Admin Endpoints
+# -----------------------------------------------------------------------------
+
+@app.get("/admin", tags=["Admin"])
+async def admin_page(request: Request):
+    """Admin dashboard - only accessible by admins."""
+    user = get_user_from_session(request)
+    if not user:
+        return RedirectResponse(url="/auth/login")
+    
+    if not user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    from auth.database import list_users, get_pending_access_requests, get_default_permissions
+    from auth.database import get_all_access_requests, get_all_user_permissions
+    
+    users = list_users()
+    pending_requests = get_pending_access_requests()
+    all_requests = get_all_access_requests()
+    default_perms = get_default_permissions()
+    all_user_perms = get_all_user_permissions()
+    
+    # Get available tools for each connector
+    app_state = _get_state()
+    connector_tools = {}
+    for conn in app_state.connectors.list_connectors():
+        name = conn.get("name")
+        tools = []
+        conn_obj = app_state.connectors.get_connector(name)
+        if conn_obj:
+            try:
+                import asyncio
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        tools = conn_obj.get_tools()
+                    else:
+                        tools = loop.run_until_complete(conn_obj.get_tools_async())
+                except RuntimeError:
+                    tools = asyncio.run(conn_obj.get_tools_async())
+            except Exception:
+                tools = conn_obj.get_tools()
+        connector_tools[name] = [t.name for t in tools]
+    
+    return render_template(
+        "admin.html",
+        user=user,
+        users=users,
+        pending_requests=pending_requests,
+        all_requests=all_requests,
+        default_permissions=default_perms,
+        all_user_permissions=all_user_perms,
+        connector_tools=connector_tools,
+    )
+
+
+@app.post("/admin/users/{user_id}/set-admin", tags=["Admin"])
+async def set_user_admin(user_id: str, request: Request):
+    """Make a user an admin."""
+    user = get_user_from_session(request)
+    if not user or not user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    from auth.database import set_user_admin as db_set_admin
+    db_set_admin(user_id, True)
+    
+    return RedirectResponse(url="/admin", status_code=303)
+
+
+@app.post("/admin/users/{user_id}/remove-admin", tags=["Admin"])
+async def remove_user_admin(user_id: str, request: Request):
+    """Remove admin from a user."""
+    user = get_user_from_session(request)
+    if not user or not user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    from auth.database import set_user_admin as db_set_admin
+    db_set_admin(user_id, False)
+    
+    return RedirectResponse(url="/admin", status_code=303)
+
+
+@app.post("/admin/default-permissions", tags=["Admin"])
+async def set_default_permission(
+    request: Request,
+    connector_name: str = Form(...),
+    tools: Optional[str] = Form(None),
+):
+    """Set default permissions for new users."""
+    user = get_user_from_session(request)
+    if not user or not user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    from auth.database import set_connector_permission
+    import json
+    tools_list = json.loads(tools) if tools else None
+    
+    set_connector_permission(
+        user_id="default",  # Special default user
+        connector_name=connector_name,
+        tools=tools_list,
+        is_default=True,
+        created_by=user["id"],
+    )
+    
+    return RedirectResponse(url="/admin", status_code=303)
+
+
+@app.post("/admin/users/{user_id}/permissions", tags=["Admin"])
+async def set_user_permission(
+    user_id: str,
+    request: Request,
+    connector_name: str = Form(...),
+    tools: Optional[str] = Form(None),
+):
+    """Set permissions for a specific user."""
+    user = get_user_from_session(request)
+    if not user or not user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    from auth.database import set_connector_permission
+    import json
+    tools_list = json.loads(tools) if tools else None
+    
+    set_connector_permission(
+        user_id=user_id,
+        connector_name=connector_name,
+        tools=tools_list,
+        created_by=user["id"],
+    )
+    
+    return RedirectResponse(url="/admin", status_code=303)
+
+
+@app.post("/admin/access-requests/{request_id}/approve", tags=["Admin"])
+async def approve_access_request(request_id: int, request: Request, note: Optional[str] = Form(None)):
+    """Approve an access request."""
+    user = get_user_from_session(request)
+    if not user or not user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    from auth.database import review_access_request
+    review_access_request(request_id, user["id"], approved=True, note=note)
+    
+    return RedirectResponse(url="/admin", status_code=303)
+
+
+@app.post("/admin/access-requests/{request_id}/reject", tags=["Admin"])
+async def reject_access_request(request_id: int, request: Request, note: Optional[str] = Form(None)):
+    """Reject an access request."""
+    user = get_user_from_session(request)
+    if not user or not user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    from auth.database import review_access_request
+    review_access_request(request_id, user["id"], approved=False, note=note)
+    
+    return RedirectResponse(url="/admin", status_code=303)
+
+
+# -----------------------------------------------------------------------------
+# Access Request Endpoints (for regular users)
+# -----------------------------------------------------------------------------
+
+@app.get("/access-requests", tags=["Web UI"])
+async def my_access_requests_page(request: Request):
+    """User's access requests page."""
+    user = get_user_from_session(request)
+    if not user:
+        return RedirectResponse(url="/auth/login")
+    
+    from auth.database import get_user_access_requests
+    requests = get_user_access_requests(user["id"])
+    
+    return render_template(
+        "access_requests.html",
+        user=user,
+        requests=requests,
+    )
+
+
+@app.post("/access-requests", tags=["Web UI"])
+async def create_access_request_action(
+    request: Request,
+    connector_name: str = Form(...),
+    requested_tools: Optional[str] = Form(None),
+    reason: Optional[str] = Form(None),
+):
+    """Create a new access request."""
+    user = get_user_from_session(request)
+    if not user:
+        return RedirectResponse(url="/auth/login")
+    
+    from auth.database import create_access_request
+    import json
+    tools_list = json.loads(requested_tools) if requested_tools else None
+    
+    create_access_request(
+        user_id=user["id"],
+        connector_name=connector_name,
+        requested_tools=tools_list,
+        reason=reason,
+    )
+    
+    return RedirectResponse(url="/access-requests", status_code=303)
 
 
 @app.get("/", tags=["Web UI"])
@@ -2557,6 +2774,18 @@ async def tool_fn({params_str}) -> str:
                 user_token = await get_token_store().get_token(user_id, "{connector_name}")
             except Exception:
                 pass
+
+    # Check granular access permissions
+    if user_id:
+        try:
+            from auth.database import check_user_tool_access
+            if not check_user_tool_access(user_id, "{connector_name}", "{tool_name}"):
+                return json.dumps({{
+                    "error": "Access denied",
+                    "hint": "You don't have permission to use this tool. Request access at http://localhost:8000/access-requests",
+                }})
+        except Exception:
+            pass
 
     requires_auth = {tool_def.requires_auth}
     if requires_auth and not user_token:

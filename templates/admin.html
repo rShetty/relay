@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Admin - Relay</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <style>
+        .admin-tabs {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 24px;
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 12px;
+        }
+        .admin-tab {
+            padding: 8px 16px;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius);
+            color: var(--text-secondary);
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .admin-tab.active {
+            background: var(--accent);
+            color: white;
+            border-color: var(--accent);
+        }
+        .admin-tab:hover:not(.active) {
+            background: var(--bg-hover);
+        }
+        .tab-content {
+            display: none;
+        }
+        .tab-content.active {
+            display: block;
+        }
+        .user-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius-lg);
+            padding: 16px;
+            margin-bottom: 16px;
+        }
+        .user-card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 12px;
+        }
+        .user-card-header h3 {
+            margin: 0;
+            font-size: 16px;
+        }
+        .perm-badge {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            margin-right: 4px;
+            margin-bottom: 4px;
+        }
+        .perm-badge.all {
+            background: var(--success-bg);
+            color: var(--success);
+        }
+        .perm-badge.limited {
+            background: var(--accent-bg);
+            color: var(--accent);
+        }
+        .permission-connector {
+            margin-top: 12px;
+        }
+        .permission-connector h4 {
+            font-size: 14px;
+            color: var(--text-secondary);
+            margin-bottom: 8px;
+        }
+        .tool-list {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+        }
+        .tool-chip {
+            padding: 2px 8px;
+            background: var(--bg-tertiary);
+            border-radius: 4px;
+            font-size: 11px;
+            color: var(--text-secondary);
+        }
+        .tool-chip.granted {
+            background: var(--success-bg);
+            color: var(--success);
+        }
+        .tool-chip.denied {
+            background: var(--danger-bg);
+            color: var(--danger);
+            text-decoration: line-through;
+            opacity: 0.6;
+        }
+        .inline-form {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        .inline-form select,
+        .inline-form input {
+            padding: 8px 12px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius);
+            color: var(--text-primary);
+        }
+    </style>
+</head>
+<body>
+    {% extends "base.html" %}
+    {% set show_sidebar = true %}
+    {% set active_page = "admin" %}
+    {% block page_title %}Admin Dashboard{% endblock %}
+    {% block content %}
+    <div class="admin-dashboard">
+        <h1>Admin Dashboard</h1>
+        
+        <div class="admin-tabs">
+            <button class="admin-tab active" onclick="showTab('users')">Users & Permissions</button>
+            <button class="admin-tab" onclick="showTab('requests')">Access Requests</button>
+            <button class="admin-tab" onclick="showTab('defaults')">Default Permissions</button>
+        </div>
+        
+        <!-- Users & Permissions Tab -->
+        <div id="tab-users" class="tab-content active">
+            {% for u in users %}
+            <div class="user-card">
+                <div class="user-card-header">
+                    <div>
+                        <h3>{{ u.username }}</h3>
+                        <span style="color: var(--text-secondary); font-size: 13px;">{{ u.email or 'No email' }}</span>
+                    </div>
+                    <div>
+                        {% if u.is_admin %}
+                        <span class="status-badge status-connected">Admin</span>
+                        {% else %}
+                        <form action="/admin/users/{{ u.id }}/set-admin" method="post" style="display:inline;">
+                            <button type="submit" class="btn btn-sm">Make Admin</button>
+                        </form>
+                        {% endif %}
+                    </div>
+                </div>
+                
+                <div class="permission-connector">
+                    <h4>Connector Permissions</h4>
+                    {% set user_perms = all_user_permissions[u.id] %}
+                    {% if user_perms %}
+                        {% for perm in user_perms %}
+                        <div style="margin-bottom: 12px;">
+                            <strong>{{ perm.connector_name }}</strong>
+                            {% if perm.tools %}
+                                <div class="tool-list">
+                                    {% for tool in connector_tools[perm.connector_name] %}
+                                    <span class="tool-chip {% if tool in perm.tools %}granted{% else %}denied{% endif %}">
+                                        {{ tool }}
+                                    </span>
+                                    {% endfor %}
+                                </div>
+                            {% else %}
+                                <span class="perm-badge all">All Tools</span>
+                            {% endif %}
+                        </div>
+                        {% endfor %}
+                    {% else %}
+                        <span style="color: var(--text-muted);">No specific permissions (all access)</span>
+                    {% endif %}
+                </div>
+                
+                <div style="margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border-color);">
+                    <form action="/admin/users/{{ u.id }}/permissions" method="post" class="inline-form">
+                        <select name="connector_name" required>
+                            <option value="">Select Connector</option>
+                            <option value="github">GitHub</option>
+                            <option value="slack">Slack</option>
+                            <option value="linear">Linear</option>
+                            <option value="openai">OpenAI</option>
+                            <option value="anthropic">Anthropic</option>
+                        </select>
+                        <input type="text" name="tools" placeholder='["tool1", "tool2"] or empty for all'>
+                        <button type="submit" class="btn btn-sm btn-primary">Update Permission</button>
+                    </form>
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+        
+        <!-- Access Requests Tab -->
+        <div id="tab-requests" class="tab-content">
+            <h2>Pending Access Requests</h2>
+            {% if pending_requests %}
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>User</th>
+                        <th>Connector</th>
+                        <th>Requested Tools</th>
+                        <th>Reason</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for req in pending_requests %}
+                    <tr>
+                        <td>{{ req.username }}</td>
+                        <td>{{ req.connector_name }}</td>
+                        <td>{{ req.requested_tools|join(', ') if req.requested_tools else 'All tools' }}</td>
+                        <td>{{ req.reason or '-' }}</td>
+                        <td>
+                            <form action="/admin/access-requests/{{ req.id }}/approve" method="post" style="display:inline;">
+                                <button type="submit" class="btn btn-sm btn-primary">Approve</button>
+                            </form>
+                            <form action="/admin/access-requests/{{ req.id }}/reject" method="post" style="display:inline;">
+                                <button type="submit" class="btn btn-sm btn-danger">Reject</button>
+                            </form>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            {% else %}
+            <p class="empty-state">No pending access requests</p>
+            {% endif %}
+            
+            <h2 style="margin-top: 32px;">All Access Requests</h2>
+            {% if all_requests %}
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>User</th>
+                        <th>Connector</th>
+                        <th>Status</th>
+                        <th>Requested</th>
+                        <th>Reviewed</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for req in all_requests %}
+                    <tr>
+                        <td>{{ req.username }}</td>
+                        <td>{{ req.connector_name }}</td>
+                        <td>
+                            <span class="status-badge 
+                                {% if req.status == 'approved' %}status-connected
+                                {% elif req.status == 'rejected' %}status-disconnected
+                                {% else %}status-pending{% endif %}">
+                                {{ req.status }}
+                            </span>
+                        </td>
+                        <td>{{ req.requested_at }}</td>
+                        <td>{{ req.reviewed_at or '-' }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            {% else %}
+            <p class="empty-state">No access requests</p>
+            {% endif %}
+        </div>
+        
+        <!-- Default Permissions Tab -->
+        <div id="tab-defaults" class="tab-content">
+            <h2>Default Permissions for New Users</h2>
+            <form action="/admin/default-permissions" method="post" class="inline-form" style="margin-bottom: 24px;">
+                <select name="connector_name" required>
+                    <option value="">Select Connector</option>
+                    <option value="github">GitHub</option>
+                    <option value="slack">Slack</option>
+                    <option value="linear">Linear</option>
+                    <option value="openai">OpenAI</option>
+                    <option value="anthropic">Anthropic</option>
+                </select>
+                <input type="text" name="tools" placeholder='["tool1", "tool2"] or leave empty for all'>
+                <button type="submit" class="btn btn-primary">Set Default</button>
+            </form>
+            
+            {% if default_permissions %}
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>Connector</th>
+                        <th>Allowed Tools</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for perm in default_permissions %}
+                    <tr>
+                        <td>{{ perm.connector_name }}</td>
+                        <td>{{ perm.tools|join(', ') if perm.tools else 'All tools' }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            {% else %}
+            <p class="empty-state">No default permissions set</p>
+            {% endif %}
+        </div>
+    </div>
+    
+    <script>
+        function showTab(tabName) {
+            document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+            document.querySelectorAll('.admin-tab').forEach(el => el.classList.remove('active'));
+            
+            document.getElementById('tab-' + tabName).classList.add('active');
+            event.target.classList.add('active');
+        }
+    </script>
+    {% endblock %}
+</body>
+</html>

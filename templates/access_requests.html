@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Access Requests - Relay</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    {% extends "base.html" %}
+    {% set show_sidebar = true %}
+    {% set active_page = "access-requests" %}
+    {% block page_title %}My Access Requests{% endblock %}
+    {% block content %}
+    <div class="access-requests-page">
+        <h1>My Access Requests</h1>
+        
+        <div class="request-form">
+            <h2>Request New Access</h2>
+            <form action="/access-requests" method="post">
+                <div class="form-group">
+                    <label for="connector_name">Connector</label>
+                    <select name="connector_name" id="connector_name" required>
+                        <option value="">Select a connector</option>
+                        <option value="github">GitHub</option>
+                        <option value="slack">Slack</option>
+                        <option value="linear">Linear</option>
+                        <option value="openai">OpenAI</option>
+                        <option value="anthropic">Anthropic</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="requested_tools">Specific Tools (optional)</label>
+                    <input type="text" name="requested_tools" id="requested_tools" placeholder='["tool1", "tool2"] - leave empty for all tools'>
+                    <p class="help-text">Enter a JSON array of tool names you need access to. Leave empty to request all tools.</p>
+                </div>
+                <div class="form-group">
+                    <label for="reason">Reason</label>
+                    <textarea name="reason" id="reason" rows="3" placeholder="Why do you need access to this connector?"></textarea>
+                </div>
+                <button type="submit" class="btn btn-primary">Submit Request</button>
+            </form>
+        </div>
+        
+        <div class="requests-list">
+            <h2>Your Requests</h2>
+            {% if requests %}
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>Connector</th>
+                        <th>Requested Tools</th>
+                        <th>Reason</th>
+                        <th>Status</th>
+                        <th>Requested</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for req in requests %}
+                    <tr>
+                        <td>{{ req.connector_name }}</td>
+                        <td>{{ req.requested_tools|join(', ') if req.requested_tools else 'All tools' }}</td>
+                        <td>{{ req.reason or '-' }}</td>
+                        <td>
+                            <span class="status-badge 
+                                {% if req.status == 'approved' %}status-connected
+                                {% elif req.status == 'rejected' %}status-disconnected
+                                {% else %}status-pending{% endif %}">
+                                {{ req.status }}
+                            </span>
+                        </td>
+                        <td>{{ req.requested_at }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            {% else %}
+            <p class="empty-state">You haven't made any access requests yet.</p>
+            {% endif %}
+        </div>
+    </div>
+    {% endblock %}
+</body>
+</html>

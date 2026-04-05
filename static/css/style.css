@@ -791,3 +791,9 @@ a:hover { color: var(--accent-hover); }
 .copy-btn:hover {
     background: var(--accent-hover);
 }
+
+/* Status badges */
+.status-pending {
+    background: var(--warning);
+    color: white;
+}
