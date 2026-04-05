@@ -1,5 +1,5 @@
 """
-MCP Gateway Configuration
+Relay Configuration
 
 Centralized settings using Pydantic for validation and environment variable support.
 """
@@ -168,10 +168,10 @@ class ServerSettings(BaseSettings):
     cors_headers: List[str] = Field(default_factory=lambda: ["*"])
 
     # MCP Server info
-    server_name: str = "mcp-gateway"
+    server_name: str = "relay"
     server_version: str = "0.1.0"
     server_instructions: str = (
-        "MCP Gateway - OAuth-authenticated proxy for connecting to "
+        "Relay - OAuth-authenticated proxy for connecting to "
         "third-party MCP servers and APIs. Use tools to discover "
         "backends and route requests through this gateway."
     )
@@ -187,18 +187,18 @@ class DatabaseSettings(BaseSettings):
 
     # Redis (for rate limiting, sessions, caching)
     redis_url: Optional[str] = None
-    redis_prefix: str = "mcp_gateway:"
+    redis_prefix: str = "relay:"
 
 
-class GatewayConfig(BaseSettings):
+class RelayConfig(BaseSettings):
     """
-    Master configuration for MCP Gateway.
+    Master configuration for Relay.
 
     Loads from environment variables with sensible defaults.
     """
 
     model_config = SettingsConfigDict(
-        env_prefix="MCP_GATEWAY_",
+        env_prefix="RELAY_",
         env_nested_delimiter="__",
         case_sensitive=False,
     )
@@ -236,10 +236,10 @@ class GatewayConfig(BaseSettings):
         return self.environment == "development"
 
 
-_config_cache: Optional[GatewayConfig] = None
+_config_cache: Optional[RelayConfig] = None
 
 
-def get_config(force_reload: bool = False) -> GatewayConfig:
+def get_config(force_reload: bool = False) -> RelayConfig:
     """
     Get cached configuration instance.
     
@@ -248,7 +248,7 @@ def get_config(force_reload: bool = False) -> GatewayConfig:
     """
     global _config_cache
     if _config_cache is None or force_reload:
-        _config_cache = GatewayConfig(_env_file=".env")
+        _config_cache = RelayConfig(_env_file=".env")
     return _config_cache
 
 

@@ -1,5 +1,5 @@
 """
-MCP Gateway Server
+Relay Server
 
 The main MCP server that accepts connections from MCP clients (Cursor, Claude Code)
 and routes requests to backend services through OAuth authentication.
@@ -33,7 +33,7 @@ from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from config.settings import (
-    GatewayConfig,
+    RelayConfig,
     get_config,
     BACKEND_DEFINITIONS,
     ROUTING_CONFIG,
@@ -105,7 +105,7 @@ from auth.oauth_providers import OAuthProvider as ConnectorOAuthProvider
 @dataclass
 class AppState:
     """Global application state."""
-    config: GatewayConfig
+    config: RelayConfig
     oauth: OAuthProvider
     connector_oauth: ConnectorOAuthProvider
     security: SecurityContext
@@ -128,7 +128,7 @@ def _get_state() -> AppState:
     return state
 
 
-def _create_app_state_sync(config: GatewayConfig) -> AppState:
+def _create_app_state_sync(config: RelayConfig) -> AppState:
     """
     Create AppState synchronously for standalone MCP server mode.
     
@@ -376,13 +376,13 @@ async def lifespan(app: FastAPI):
     async with AsyncExitStack() as stack:
         for sm in connector_session_managers:
             await stack.enter_async_context(sm.run())
-        logger.info(f"MCP Gateway started on {config.server.host}:{config.server.port}")
+        logger.info(f"Relay started on {config.server.host}:{config.server.port}")
         yield
     
     # Shutdown
     await backends.stop()
     await connectors.close_all()
-    logger.info("MCP Gateway stopped")
+    logger.info("Relay stopped")
 
 
 # -----------------------------------------------------------------------------
@@ -390,7 +390,7 @@ async def lifespan(app: FastAPI):
 # -----------------------------------------------------------------------------
 
 app = FastAPI(
-    title="MCP Gateway",
+    title="Relay",
     description="OAuth-authenticated MCP proxy for third-party services",
     version="0.1.0",
     lifespan=lifespan,
@@ -1912,8 +1912,8 @@ def create_proxy_mcp_server(backend_id: str = "github") -> Optional[Any]:
         return state.backends.list_tools()
     
     mcp = FastMCP(
-        f"mcp-gateway-{backend_id}",
-        instructions=f"MCP Gateway proxying to {backend_id} backend",
+        f"relay-{backend_id}",
+        instructions=f"Relay proxying to {backend_id} backend",
     )
 
     @mcp.tool()
@@ -2009,7 +2009,7 @@ def run_mcp_proxy(backend_id: str = "github"):
             from mcp.types import Tool, TextContent
             from mcp.server.stdio import stdio_server
             
-            server = Server(f"mcp-gateway-proxy-{backend_id}")
+            server = Server(f"relay-proxy-{backend_id}")
             
             @server.list_tools()
             async def list_tools():
@@ -2056,7 +2056,7 @@ def run_mcp_proxy(backend_id: str = "github"):
 # -----------------------------------------------------------------------------
 
 def run_server():
-    """Run the MCP Gateway server."""
+    """Run the Relay server."""
     import uvicorn
     
     config = get_config()
@@ -2093,7 +2093,7 @@ def run_mcp_server(transport: str = "stdio", port: int = None):
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description="MCP Gateway Server")
+    parser = argparse.ArgumentParser(description="Relay Server")
     parser.add_argument(
         "mode",
         choices=["http", "mcp"],

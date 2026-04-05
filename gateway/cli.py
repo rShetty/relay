@@ -1,7 +1,7 @@
 """
-MCP Gateway CLI
+Relay CLI
 
-Command-line interface for managing the MCP Gateway.
+Command-line interface for managing the Relay.
 """
 
 import argparse
@@ -13,7 +13,7 @@ from typing import Optional
 
 
 def cmd_serve(args):
-    """Start the MCP Gateway server."""
+    """Start the Relay server."""
     from gateway.server import run_server
     run_server()
 
@@ -158,7 +158,7 @@ def cmd_call_tool(args):
 
 
 def cmd_mcp_proxy(args):
-    """Run the MCP gateway as a proxy to a backend."""
+    """Run the Relay as a proxy to a backend."""
     from gateway.server import run_mcp_proxy
     run_mcp_proxy(backend_id=args.backend)
 
@@ -244,27 +244,27 @@ def cmd_generate_pkce(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="MCP Gateway CLI",
+        description="Relay CLI",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   # Start the HTTP server
-  mcp-gateway serve --port 8000
+  relay serve --port 8000
   
   # Start the MCP server (for stdio)
-  mcp-gateway mcp
+  relay mcp
   
   # Register an OAuth client
-  mcp-gateway register-client --name "My App" --redirect-uri "http://localhost:3000/callback"
+  relay register-client --name "My App" --redirect-uri "http://localhost:3000/callback"
   
   # Authorize a client
-  mcp-gateway authorize --client-id CLIENT_ID --redirect-uri "http://localhost:3000/callback"
+  relay authorize --client-id CLIENT_ID --redirect-uri "http://localhost:3000/callback"
   
   # List backends
-  mcp-gateway list-backends --token YOUR_ACCESS_TOKEN
+  relay list-backends --token YOUR_ACCESS_TOKEN
   
   # Call a tool
-  mcp-gateway call --tool search_repositories --arguments '{"query": "mcp"}' --token YOUR_TOKEN
+  relay call --tool search_repositories --arguments '{"query": "mcp"}' --token YOUR_TOKEN
 """,
     )
     

@@ -557,7 +557,7 @@ class TestFastAPIEndpoints:
         from auth.oauth import create_oauth_provider
         from auth.oauth_providers import create_oauth_provider as create_connector_oauth
         from backends.manager import BackendManager
-        from config.settings import GatewayConfig
+        from config.settings import RelayConfig
         from connectors import ConnectorRegistry
         from security.middleware import (
             AuditLogger,

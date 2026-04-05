@@ -1,1 +1,1 @@
-"""MCP Gateway tests module."""
+"""Relay tests module."""

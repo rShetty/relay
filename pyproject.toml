@@ -1,7 +1,7 @@
 [project]
-name = "mcp-gateway"
+name = "relay"
 version = "0.1.0"
-description = "MCP Gateway - OAuth-authenticated proxy for MCP clients to third-party services"
+description = "Relay - OAuth-authenticated proxy for MCP clients to third-party services"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
@@ -46,7 +46,7 @@ dev = [
 ]
 
 [project.scripts]
-mcp-gateway = "gateway.cli:main"
+relay = "gateway.cli:main"
 
 [build-system]
 requires = ["hatchling"]

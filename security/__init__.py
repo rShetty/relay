@@ -1,1 +1,1 @@
-"""MCP Gateway security module."""
+"""Relay security module."""

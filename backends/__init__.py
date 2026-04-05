@@ -1,1 +1,1 @@
-"""MCP Gateway backends module."""
+"""Relay backends module."""

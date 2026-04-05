@@ -1,1 +1,1 @@
-"""MCP Gateway auth module."""
+"""Relay auth module."""

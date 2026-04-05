@@ -1,6 +1,6 @@
 #!/bin/bash
-# MCP Gateway MCP Server launcher
-# This script runs the gateway in MCP stdio mode
+# Relay MCP Server launcher
+# This script runs the relay in MCP stdio mode
 
 cd /Users/rshetty/agentic-gateway
 

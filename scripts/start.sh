@@ -1,5 +1,5 @@
 #!/bin/bash
-# MCP Gateway Startup Script
+# Relay Startup Script
 
 set -e
 
@@ -9,24 +9,24 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-echo -e "${GREEN}=== MCP Gateway ===${NC}"
+echo -e "${GREEN}=== Relay ===${NC}"
 echo ""
 
 # Check for .env file
 if [ ! -f .env ]; then
     echo -e "${YELLOW}No .env file found. Creating default...${NC}"
     cat > .env << EOF
-# MCP Gateway Configuration
-MCP_GATEWAY_ENVIRONMENT=development
-MCP_GATEWAY_SERVER__PORT=8000
+# Relay Configuration
+RELAY_ENVIRONMENT=development
+RELAY_SERVER__PORT=8000
 
 # OAuth (auto-generated in dev)
-OAUTH_JWT_SECRET_KEY=$(openssl rand -hex 32)
+RELAY_OAUTH__JWT_SECRET_KEY=$(openssl rand -hex 32)
 
 # Security
-MCP_GATEWAY_SECURITY__RATE_LIMIT_REQUESTS_PER_MINUTE=60
-MCP_GATEWAY_SECURITY__AUDIT_ENABLED=true
-MCP_GATEWAY_SECURITY__AUDIT_LOG_PATH=logs/audit.log
+RELAY_SECURITY__RATE_LIMIT_REQUESTS_PER_MINUTE=60
+RELAY_SECURITY__AUDIT_ENABLED=true
+RELAY_SECURITY__AUDIT_LOG_PATH=logs/audit.log
 
 # Backend Credentials (set these for backend access)
 # GITHUB_PERSONAL_ACCESS_TOKEN=ghp_xxx

@@ -1,19 +1,19 @@
 version: '3.8'
 
 services:
-  gateway:
+  relay:
     build:
       context: .
       dockerfile: Dockerfile
     ports:
       - "8000:8000"
     environment:
-      - MCP_GATEWAY_ENVIRONMENT=production
-      - MCP_GATEWAY_SERVER__HOST=0.0.0.0
-      - MCP_GATEWAY_SERVER__PORT=8000
-      - MCP_GATEWAY_OAUTH__JWT_SECRET_KEY=${JWT_SECRET_KEY:-change-me-in-production}
-      - MCP_GATEWAY_SECURITY__AUDIT_ENABLED=true
-      - MCP_GATEWAY_SECURITY__AUDIT_LOG_PATH=/app/logs/audit.log
+      - RELAY_ENVIRONMENT=production
+      - RELAY_SERVER__HOST=0.0.0.0
+      - RELAY_SERVER__PORT=8000
+      - RELAY_OAUTH__JWT_SECRET_KEY=${JWT_SECRET_KEY:-change-me-in-production}
+      - RELAY_SECURITY__AUDIT_ENABLED=true
+      - RELAY_SECURITY__AUDIT_LOG_PATH=/app/logs/audit.log
       # Backend credentials (set in .env or here)
       - GITHUB_PERSONAL_ACCESS_TOKEN=${GITHUB_PAT:-}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}

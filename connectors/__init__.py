@@ -1,5 +1,5 @@
 """
-Connector Registry for MCP Gateway
+Connector Registry for Relay
 
 Manages all third-party connectors and provides:
 - Connector registration and discovery

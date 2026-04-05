@@ -1,5 +1,5 @@
 """
-Slack API Connector for MCP Gateway
+Slack API Connector for Relay
 
 Provides tools for:
 - Messaging (post, update, delete, schedule)

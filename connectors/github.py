@@ -1,5 +1,5 @@
 """
-Third-Party Service Connectors for MCP Gateway
+Third-Party Service Connectors for Relay
 
 Each connector implements:
 - Authentication handling for the specific service

@@ -1,5 +1,5 @@
 """
-Linear API Connector for MCP Gateway
+Linear API Connector for Relay
 
 Provides tools for Linear issue tracking:
 - Issues (create, update, search, get)

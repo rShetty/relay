@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
-from config.settings import GatewayConfig
+from config.settings import RelayConfig
 
 
 @dataclass
@@ -34,7 +34,7 @@ class OAuthProvider:
     Generic OAuth provider that supports multiple services.
     """
     
-    def __init__(self, config: GatewayConfig):
+    def __init__(self, config: RelayConfig):
         self.config = config
         
         # In-memory stores (use Redis in production)
@@ -298,6 +298,6 @@ class OAuthProvider:
         return connector in self._tokens and user_id in self._tokens[connector]
 
 
-def create_oauth_provider(config: GatewayConfig) -> OAuthProvider:
+def create_oauth_provider(config: RelayConfig) -> OAuthProvider:
     """Create OAuth provider from config."""
     return OAuthProvider(config=config)
