@@ -1,14 +1,17 @@
-# MCP Gateway
+# Relay
 
 **OAuth-authenticated MCP proxy for connecting MCP clients to third-party services.**
 
-An MCP Gateway acts as a middle layer between MCP clients (like Cursor, Claude Code, Windsurf, OpenCode) and third-party services. It provides:
+An MCP Gateway acts as a middle layer between MCP clients (like Cursor, Claude Code, Windsurf, OpenCode, Gemini CLI) and third-party services. It provides:
 
+- **Multi-User System** - Signup/login with API keys for each user
 - **OAuth 2.1 Authentication** with PKCE for secure client authentication
 - **Per-User Token Management** - Each user gets their own third-party tokens (GitHub, Slack, Linear, etc.)
+- **Per-User MCP Endpoints** - Connect MCP clients using API key in URL path
 - **Backend Aggregation** - Connect to MCP servers OR direct APIs with OAuth support
+- **Dynamic Tool Discovery** - Tools auto-discovered from all connectors
+- **Resources & Prompts** - MCP Resources and Prompts from connectors
 - **Security Layer** - Rate limiting, input validation, audit logging
-- **Tool Discovery** - Automatic aggregation of tools from all backends
 
 ## Architecture
 
@@ -65,60 +68,39 @@ EOF
 
 ### 3. Start the Server
 
-**HTTP Mode (for web/REST access):**
 ```bash
-mcp-gateway serve --port 8000
+cd relay
+pip install -e .
+python -m gateway.server
 ```
 
-**MCP Mode (for MCP client connection):**
-```bash
-mcp-gateway mcp
+Server runs on http://localhost:8000
+
+### 4. Create an Account
+
+Visit http://localhost:8000/auth/register to create a user account. You'll automatically get an API key.
+
+### 5. Connect Third-Party Services
+
+1. Visit http://localhost:8000/connectors
+2. Click "Connect" on any service (GitHub, Slack, Linear)
+3. Complete OAuth flow to link your account
+
+### 6. Connect MCP Clients
+
+Each connector has a unique MCP endpoint using your API key:
+
+```json
+{
+  "mcpServers": {
+    "relay-github": {
+      "url": "http://localhost:8000/user-mcp/{api_key}/github/mcp"
+    }
+  }
+}
 ```
 
-### 4. Register an OAuth Client
-
-```bash
-mcp-gateway register-client \
-  --name "My Cursor" \
-  --redirect-uri "cursor://oauth/callback"
-```
-
-Output:
-```
-Client registered successfully!
-  Client ID: client_ABC123...
-  Client Name: My Cursor
-  Redirect URIs: ['cursor://oauth/callback']
-```
-
-### 5. Authorize the Client
-
-```bash
-mcp-gateway authorize \
-  --client-id client_ABC123... \
-  --redirect-uri "cursor://oauth/callback" \
-  --output tokens.json
-```
-
-This will:
-1. Generate PKCE code verifier/challenge
-2. Open the authorization URL
-3. Prompt for the authorization code
-4. Exchange the code for access/refresh tokens
-5. Save tokens to `tokens.json`
-
-### 6. Use the Gateway
-
-```bash
-# List available backends
-mcp-gateway list-backends --token YOUR_ACCESS_TOKEN
-
-# Call a tool
-mcp-gateway call \
-  --tool search_repositories \
-  --arguments '{"query": "mcp gateway"}' \
-  --token YOUR_ACCESS_TOKEN
-```
+Copy the config from the connector detail page at `/connectors/{connector_name}`.
 
 ## REST API (Non-MCP Clients)
 
@@ -275,9 +257,52 @@ curl -X POST http://localhost:8000/v1/batch \
 
 ## Connecting MCP Clients
 
-### Cursor
+### Per-User MCP Endpoints
 
-Add to your Cursor MCP settings:
+Each user has their own MCP endpoint with the API key in the URL path:
+
+```
+http://localhost:8000/user-mcp/{api_key}/{connector_name}/mcp
+```
+
+This allows MCP clients like Cursor, Claude Code, Gemini CLI, and OpenCode to connect without OAuth dance.
+
+**Supported Clients:**
+
+| Client | Configuration |
+|--------|--------------|
+| Claude Code | `{"url": "http://localhost:8000/user-mcp/{api_key}/github/mcp"}` |
+| Cursor | `{"url": "http://localhost:8000/user-mcp/{api_key}/github/mcp"}` |
+| Gemini CLI | `url: http://localhost:8000/user-mcp/{api_key}/github/mcp` |
+| OpenCode | `{"url": "http://localhost:8000/user-mcp/{api_key}/github/mcp"}` |
+
+The connector detail page (e.g., `/connectors/github`) provides ready-to-copy configurations for each client.
+
+### MCP Resources
+
+Each connector exposes MCP Resources for dynamic data:
+
+| Connector | Resources |
+|-----------|-----------|
+| GitHub | User info, repository details, recent issues |
+| Slack | Channel list, user list |
+| Linear | Team info, workspace info |
+| OpenAI | Available models |
+| Anthropic | Available models |
+
+### MCP Prompts
+
+Each connector provides reusable prompts:
+
+| Connector | Prompts |
+|-----------|---------|
+| GitHub | Create issue, review PR, summarize repo |
+| Slack | Send daily standup, channel summary |
+| Linear | Create sprint issue, weekly report |
+
+### Legacy OAuth Authentication
+
+For traditional OAuth flow, use the main MCP server at `/mcp` with Bearer token:
 
 ```json
 {
@@ -290,59 +315,6 @@ Add to your Cursor MCP settings:
     }
   }
 }
-```
-
-Note: The MCP server runs on port 8001 (streamable-http) or use stdio mode below.
-
-### Claude Code (Claude Desktop)
-
-For stdio mode (recommended), add to `claude_desktop_config.json`:
-
-```json
-{
-  "mcpServers": {
-    "gateway": {
-      "command": "python",
-      "args": ["-m", "gateway.server", "mcp"],
-      "env": {
-        "PYTHONPATH": "/Users/rshetty/agentic-gateway"
-      }
-    }
-  }
-}
-```
-
-### OpenCode
-
-For stdio mode, add to your `opencode.json` or `.mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "gateway": {
-      "command": "bash",
-      "args": ["-c", "source venv/bin/activate && python -m gateway.server mcp"],
-      "env": {
-        "PYTHONPATH": "/Users/rshetty/agentic-gateway"
-      }
-    }
-  }
-}
-```
-
-Or use the CLI:
-```bash
-mcp-gateway mcp
-```
-
-### Windsurf / VS Code Extensions
-
-Configure the MCP endpoint (streamable-http mode):
-
-```
-Endpoint: http://localhost:8000/mcp
-Headers:
-  Authorization: Bearer YOUR_ACCESS_TOKEN
 ```
 
 ## Security Features

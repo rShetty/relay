@@ -1,42 +1,51 @@
-# MCP Gateway Architecture
+# Relay Architecture
 
 ## Overview
 
-The MCP Gateway is an OAuth 2.1-authenticated proxy that enables AI coding clients (OpenCode, Claude Code, Cursor) to access third-party services (GitHub, Slack, Linear, etc.) through a unified interface.
+**Relay** is an OAuth 2.1-authenticated MCP proxy that enables AI coding clients (OpenCode, Claude Code, Cursor, Gemini CLI) to access third-party services (GitHub, Slack, Linear, OpenAI, Anthropic) through a unified interface.
+
+**Key Features:**
+- Multi-user system with signup/login and API keys
+- Per-user MCP endpoints (`/user-mcp/{api_key}/{connector}/mcp`) for direct client connections
+- Per-user token isolation - each user's third-party tokens are stored separately
+- Dynamic tool discovery from all connectors at startup
+- MCP Resources and Prompts from each connector
+- Web UI for account management and connector configuration
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────────┐
 │                                    RUN LAYER                                       │
 │                                                                                     │
 │  ┌───────────────┐  ┌───────────────┐  ┌───────────────┐  ┌───────────────────┐  │
-│  │ OAuth Server  │  │ Token Store   │  │ Connectors    │  │ MCP Backends      │  │
+│  │ User System   │  │ Token Store   │  │ Connectors    │  │ MCP Servers       │  │
 │  │               │  │               │  │               │  │                   │  │
-│  │ • JWT issuance│  │ • Per-user    │  │ • GitHub      │  │ • MCP servers    │  │
-│  │ • Validation │  │   tokens      │  │ • Slack       │  │ • Dynamic tools  │  │
-│  │ • Refresh    │  │ • Third-party │  │ • Linear      │  │ • Health checks  │  │
-│  │              │  │   tokens      │  │ • OpenAI      │  │                   │  │
-│  └───────────────┘  └───────────────┘  │ • Anthropic  │  └───────────────────┘  │
-│                                          └───────────────┘                        │
+│  │ • Signup/Login│  │ • Per-user    │  │ • GitHub      │  │ • /mcp/github     │  │
+│  │ • API Keys   │  │   tokens      │  │ • Slack       │  │ • /mcp/slack     │  │
+│  │ • Session    │  │ • Third-party │  │ • Linear      │  │ • /mcp/linear    │  │
+│  │              │  │   tokens      │  │ • OpenAI      │  │ • /mcp/openai    │  │
+│  └───────────────┘  └───────────────┘  │ • Anthropic  │  │ • /mcp/anthropic │  │
+│                                          └───────────────┘  └───────────────────┘  │
 │                                                                                     │
 │                              ┌─────────────────────────────────┐                   │
 │                              │      FastAPI Server (Port 8000) │                   │
+│                              │      • Web UI                   │                   │
 │                              │      • REST API                 │                   │
-│                              │      • OAuth endpoints          │                   │
-│                              │      • MCP-compatible endpoints │                   │
+│                              │      • Per-user MCP:            │                   │
+│                              │        /user-mcp/{key}/{conn}/mcp│                   │
 │                              └─────────────────────────────────┘                   │
 └─────────────────────────────────────────────────────────────────────────────────────┘
-                    │                                        │
-                    │ HTTP + JWT Auth                       │ 3rd Party Tokens
-                    ▼                                        ▼
+                    │                                                  │
+                    │ Per-User MCP (API key in URL)                  │ 3rd Party Tokens
+                    ▼                                                  ▼
 ┌─────────────────────────────┐              ┌─────────────────────────────────────┐
 │      MCP Client             │              │         Third-Party APIs           │
 │                             │              │                                     │
 │  • OpenCode ───────────────┼──────────────┼──► GitHub API                       │
-│  • Claude Code              │   OAuth 2.1  │  • Slack API                       │
-│  • Cursor                   │   JWT        │  • Linear API                      │
-│                             │              │  • OpenAI API                      │
-└─────────────────────────────┘              │  • Anthropic API                    │
-                                              └─────────────────────────────────────┘
+│  • Claude Code              │  /user-mcp/  │  • Slack API                       │
+│  • Cursor                   │  {api_key}/  │  • Linear API                      │
+│  • Gemini CLI              │  {conn}/mcp  │  • OpenAI API                      │
+│                             │              │  • Anthropic API                    │
+└─────────────────────────────┘              └─────────────────────────────────────┘
 ```
 
 ## Core Concepts
@@ -53,6 +62,8 @@ The "Run Layer" is the gateway itself - a FastAPI server that:
 
 Connectors are integrations with third-party services. Each connector:
 - Provides a set of tools (functions) for that service
+- Provides MCP Resources for dynamic data
+- Provides MCP Prompts for reusable workflows
 - Handles API authentication (uses stored user tokens)
 - Implements the service-specific API logic
 
@@ -62,6 +73,27 @@ Connectors are integrations with third-party services. Each connector:
 - `linear` - Issues, Projects, Cycles, Teams
 - `openai` - Chat completions, Embeddings, Images
 - `anthropic` - Chat completions, Token counting
+
+### 3. Per-User MCP Endpoints
+
+Each user gets a unique MCP endpoint that includes their API key in the URL path:
+
+```
+/user-mcp/{api_key}/{connector_name}/mcp
+```
+
+This endpoint:
+1. Validates the API key from the URL
+2. Looks up the user ID associated with the API key
+3. Forwards the request to the mounted MCP server at `/mcp/{connector}`
+4. Passes the user ID via `X-User-Id` header
+5. The MCP server uses the header to look up the user's token for that connector
+
+**Benefits:**
+- No OAuth dance required for MCP clients
+- Each user has isolated tokens
+- Easy to share/disable access (just revoke API key)
+- Works with any MCP client (Cursor, Claude Code, Gemini CLI, OpenCode)
 
 ### 3. MCP Backends
 
@@ -106,6 +138,56 @@ The token store manages two types of tokens:
 |------------|---------|-------------|
 | JWT Access Token | Authenticates MCP client to gateway | N/A (issued to client) |
 | Third-Party Token | Authenticates gateway to GitHub/Slack/etc | `user_id` + `connector_name` |
+
+### Per-User MCP Flow (API Key)
+
+For MCP clients that don't want OAuth dance, use per-user MCP endpoints:
+
+```
+/user-mcp/{api_key}/{connector}/mcp
+```
+
+```
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│   Cursor   │     │   Gateway   │     │    GitHub   │     │  Token Store│
+│   (MCP)    │     │             │     │    API      │     │             │
+└──────┬──────┘     └──────┬──────┘     └──────┬──────┘     └──────┬──────┘
+       │                  │                    │                  │
+       │ 1. MCP init     │                    │                  │
+       │ (URL with key)  │                    │                  │
+       │────────────────>│                    │                  │
+       │                  │                    │                  │
+       │ 2. Validate key │                    │                  │
+       │    get_api_key  │                    │                  │
+       │────────────────>│                    │                  │
+       │                  │                    │                  │
+       │ 3. Return user_id                   │                  │
+       │<───────────────│                    │                  │
+       │                  │                    │                  │
+       │ 4. Forward to   │                    │                  │
+       │    /mcp/{conn} │                    │                  │
+       │    + X-User-Id │                    │                  │
+       │    header      │                    │                  │
+       │────────────────>│                    │                  │
+       │                  │                    │                  │
+       │                  │ 5. Lookup token   │                  │
+       │                  │    by user_id     │                  │
+       │                  │─────────────────>│                  │
+       │                  │                    │                  │
+       │                  │ 6. Return token   │                  │
+       │                  │<─────────────────│                  │
+       │                  │                    │                  │
+       │                  │ 7. Call GitHub    │                  │
+       │                  │    with token    │                  │
+       │                  │──────────────────>│                  │
+       │                  │                    │                  │
+       │                  │ 8. GitHub response                   │
+       │                  │<──────────────────│                  │
+       │                  │                    │                  │
+       │ 9. Tool result  │                    │                  │
+       │<────────────────│                    │                  │
+       │                  │                    │                  │
+```
 
 ## Authentication Flow
 
@@ -558,43 +640,46 @@ To add a new connector:
 ## File Structure
 
 ```
-agentic-gateway/
+relay/
 ├── auth/
-│   ├── oauth.py           # OAuth 2.1 server (JWT, PKCE)
-│   ├── oauth_providers.py # Third-party OAuth (GitHub, Slack, Linear)
-│   └── token_store.py     # Token storage (per-user, per-connector)
+│   ├── database.py          # SQLite database with users and api_keys tables
+│   ├── db_init.py          # Database initialization
+│   ├── oauth.py             # OAuth 2.1 server (JWT, PKCE)
+│   ├── oauth_providers.py   # Third-party OAuth (GitHub, Slack, Linear)
+│   └── token_store.py       # Token storage (per-user, per-connector)
 ├── backends/
-│   └── manager.py         # MCP backend management
+│   └── manager.py           # MCP backend management
 ├── config/
-│   └── settings.py        # Pydantic settings (all config)
+│   └── settings.py          # Pydantic settings (all config)
 ├── connectors/
-│   ├── __init__.py        # Connector registry
-│   ├── base.py           # BaseConnector class
-│   ├── github.py         # GitHub connector
-│   ├── slack.py          # Slack connector
-│   ├── linear.py         # Linear connector
-│   └── ai_providers.py   # OpenAI, Anthropic
+│   ├── __init__.py          # Connector registry with Resources & Prompts
+│   ├── base.py              # BaseConnector class
+│   ├── github.py            # GitHub connector
+│   ├── slack.py             # Slack connector
+│   ├── linear.py            # Linear connector
+│   └── ai_providers.py     # OpenAI, Anthropic
 ├── gateway/
-│   ├── server.py         # FastAPI app + MCP server
-│   └── cli.py            # CLI commands
+│   ├── server.py           # FastAPI app with per-user MCP endpoints
+│   └── cli.py              # CLI commands
 ├── security/
-│   └── middleware.py     # Rate limiting, validation
-├── scripts/
-│   └── run-mcp.sh        # MCP server launcher
-├── opencode.json         # OpenCode MCP config
-└── .env                  # Environment variables
+│   └── middleware.py       # Rate limiting, validation
+├── templates/              # Web UI Jinja2 templates
+├── static/                 # CSS, JS for web UI
+└── .env                    # Environment variables
 ```
 
 ## Glossary
 
 | Term | Definition |
 |------|------------|
-| Run Layer | The gateway server that orchestrates connections |
+| Relay | The gateway server that orchestrates connections |
 | Connector | Integration with a third-party service |
+| API Key | User-specific key for per-user MCP endpoints |
 | JWT | JSON Web Token (OAuth 2.1 access token) |
 | Third-party token | OAuth token for GitHub/Slack/etc (stored in gateway) |
 | MCP | Model Context Protocol (client-server communication) |
 | PKCE | Proof Key for Code Exchange (OAuth security) |
+| X-User-Id | Header passed to MCP servers for per-user token lookup |
 
 ---
 
