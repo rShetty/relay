@@ -1,0 +1,111 @@
+{% extends "base.html" %}
+{% set show_sidebar = true %}
+{% set active_page = "api-keys" %}
+{% block page_title %}API Keys{% endblock %}
+{% block content %}
+<div class="api-keys-page" x-data="apiKeyManager()">
+    <div class="section-header">
+        <h2>Your API Keys</h2>
+        <button class="btn btn-primary" @click="showCreate = true">Generate New Key</button>
+    </div>
+
+    {% if api_keys %}
+    <div class="api-keys-list">
+        {% for key in api_keys %}
+        <div class="api-key-item">
+            <div class="api-key-info">
+                <code class="api-key-value">{{ key.masked_key }}</code>
+                <span class="api-key-meta">Created {{ key.created_at }}</span>
+            </div>
+            <form action="/api-keys/{{ key.client_id }}/revoke" method="post" class="inline-form">
+                <button type="submit" class="btn btn-outline btn-sm btn-danger" onclick="return confirm('Revoke this API key?')">Revoke</button>
+            </form>
+        </div>
+        {% endfor %}
+    </div>
+    {% else %}
+    <div class="empty-state">
+        <svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M18 8a6 6 0 01-7.743 5.743L10 14l-1 1-1 1H6v2H2v-4l4.257-4.257A6 6 0 1118 8zm-6-4a1 1 0 100 2 2 2 0 012 2 1 1 0 102 0 4 4 0 00-4-4z" clip-rule="evenodd"/></svg>
+        <h3>No API keys yet</h3>
+        <p>Generate an API key to access the Relay API from CLI tools and SDKs.</p>
+    </div>
+    {% endif %}
+
+    <div class="modal-overlay" x-show="showCreate" x-cloak @click.self="showCreate = false">
+        <div class="modal">
+            <div class="modal-header">
+                <h3>Generate API Key</h3>
+                <button class="modal-close" @click="showCreate = false">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label for="key-name">Key Name</label>
+                    <input type="text" id="key-name" x-model="keyName" placeholder="e.g., CLI Access, Production SDK">
+                </div>
+                <div class="form-group">
+                    <label for="key-callback">Callback URL</label>
+                    <input type="text" id="key-callback" x-model="keyCallback" placeholder="urn:ietf:wg:oauth:2.0:oob" value="urn:ietf:wg:oauth:2.0:oob">
+                </div>
+                <div class="form-error" x-show="error" x-text="error"></div>
+                <template x-if="newKey">
+                    <div class="new-key-result">
+                        <p class="new-key-warning">Copy this key now — it won't be shown again!</p>
+                        <div class="new-key-display">
+                            <code x-text="newKey"></code>
+                            <button class="btn btn-sm" @click="copyKey">Copy</button>
+                        </div>
+                    </div>
+                </template>
+                <div class="modal-actions">
+                    <button class="btn btn-outline" @click="showCreate = false">Cancel</button>
+                    <button class="btn btn-primary" @click="createKey" :disabled="creating">
+                        <span x-show="!creating">Generate Key</span>
+                        <span x-show="creating">Generating...</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+function apiKeyManager() {
+    return {
+        showCreate: false,
+        keyName: '',
+        keyCallback: 'urn:ietf:wg:oauth:2.0:oob',
+        newKey: null,
+        error: null,
+        creating: false,
+        async createKey() {
+            this.error = null;
+            this.creating = true;
+            try {
+                const resp = await fetch('/v1/api-keys', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        client_name: this.keyName || 'API Key',
+                        redirect_uris: [this.keyCallback || 'urn:ietf:wg:oauth:2.0:oob'],
+                    }),
+                });
+                const data = await resp.json();
+                if (!resp.ok) {
+                    this.error = data.error || data.detail || 'Failed to create key';
+                    return;
+                }
+                this.newKey = data.api_key;
+            } catch (e) {
+                this.error = 'Network error';
+            } finally {
+                this.creating = false;
+            }
+        },
+        copyKey() {
+            navigator.clipboard.writeText(this.newKey);
+        }
+    };
+}
+</script>
+{% endblock %}

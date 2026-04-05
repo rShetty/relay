@@ -20,6 +20,7 @@ import asyncio
 import json
 import logging
 import os
+import secrets
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -28,9 +29,11 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from fastapi import FastAPI, HTTPException, Depends, Request, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse, Response
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
+from jinja2 import Environment, FileSystemLoader
 
 from config.settings import (
     RelayConfig,
@@ -269,6 +272,20 @@ async def lifespan(app: FastAPI):
     # Startup
     config = get_config()
     
+    # Security: validate JWT secret is not the default
+    default_secret_length = len(secrets.token_urlsafe(32))
+    if len(config.oauth.jwt_secret_key) == default_secret_length:
+        if not os.getenv("RELAY_ALLOW_DEFAULT_SECRET"):
+            raise RuntimeError(
+                "SECURITY: OAUTH_JWT_SECRET_KEY is using the default generated value. "
+                "Set a strong secret via: export OAUTH_JWT_SECRET_KEY=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))') "
+                "Or set RELAY_ALLOW_DEFAULT_SECRET=1 to bypass (NOT FOR PRODUCTION)."
+            )
+    
+    # Initialize database
+    from auth import database as db
+    db.init_db()
+    
     # Initialize database-backed OAuth
     from auth.db_init import create_database_oauth_provider
     oauth = create_database_oauth_provider(
@@ -361,6 +378,7 @@ async def lifespan(app: FastAPI):
     )
     
     # Mount per-connector MCP servers on /mcp/{connector}
+    # Note: This is for shared/default tokens. For per-user MCP, use /user-mcp/{api_key}/{connector}/mcp
     connector_session_managers = []
     for conn_name in ConnectorRegistry.CONNECTOR_TYPES:
         connector_mcp = create_connector_mcp_server(conn_name, app_state=state)
@@ -396,6 +414,31 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Static files
+import os
+_static_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static")
+if os.path.isdir(_static_dir):
+    app.mount("/static", StaticFiles(directory=_static_dir), name="static")
+
+# Jinja2 templates
+_template_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "templates")
+if os.path.isdir(_template_dir):
+    templates = Environment(
+        loader=FileSystemLoader(_template_dir),
+        autoescape=True,
+    )
+else:
+    templates = None
+
+
+def render_template(name: str, **context) -> HTMLResponse:
+    """Render a Jinja2 template."""
+    if templates is None:
+        return HTMLResponse(content="<h1>Templates not available</h1>", status_code=500)
+    template = templates.get_template(name)
+    return HTMLResponse(content=template.render(**context))
+
+
 # CORS middleware.
 # allow_credentials=True is incompatible with allow_origins=["*"] (CORS spec).
 # In development we allow all origins but disable credentials; in production
@@ -414,6 +457,10 @@ app.add_middleware(
 
 # Request ID tracing — registered after CORS so it wraps the full stack
 app.add_middleware(RequestIDMiddleware)
+
+# HSTS for production security
+from security.middleware import HSTSMiddleware
+app.add_middleware(HSTSMiddleware)
 
 
 # Normalize all error responses to {"error": "..."} so clients never see
@@ -651,9 +698,577 @@ async def revoke_token(request: Request):
     success = app_state.oauth.revoke_token(token)
     return {"revoked": success}
 
-@app.get("/", tags=["Info"])
-async def root():
-    """Gateway info endpoint."""
+
+# -----------------------------------------------------------------------------
+# User Authentication Endpoints
+# -----------------------------------------------------------------------------
+
+class UserRegisterRequest(BaseModel):
+    """User registration request."""
+    username: str
+    password: str
+    email: Optional[str] = None
+
+
+class UserLoginRequest(BaseModel):
+    """User login request."""
+    username: str
+    password: str
+
+
+class UserUpdateRequest(BaseModel):
+    """User profile update request."""
+    username: Optional[str] = None
+    email: Optional[str] = None
+    current_password: Optional[str] = None
+    new_password: Optional[str] = None
+
+
+def hash_password(password: str) -> str:
+    """Hash a password using PBKDF2-HMAC-SHA256 (stdlib, no external deps)."""
+    import hashlib
+    import base64
+    import os
+    salt = os.urandom(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 100_000)
+    return base64.b64encode(salt + dk).decode("utf-8")
+
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """Verify a password against its PBKDF2-HMAC-SHA256 hash."""
+    import hashlib
+    import base64
+    raw = base64.b64decode(hashed_password.encode("utf-8"))
+    salt = raw[:16]
+    stored_dk = raw[16:]
+    dk = hashlib.pbkdf2_hmac("sha256", plain_password.encode("utf-8"), salt, 100_000)
+    return dk == stored_dk
+
+
+def create_session_token(user_id: str) -> str:
+    """Create a session JWT token (24h expiry)."""
+    jwt_manager = state.oauth.jwt
+    from datetime import timedelta
+    return jwt_manager.create_access_token(
+        user_id=user_id,
+        client_id="session",
+        scope="session",
+        expires_delta=timedelta(hours=24),
+    )
+
+
+def get_user_from_session(request: Request) -> Optional[Dict[str, Any]]:
+    """Extract user from session cookie."""
+    session_token = request.cookies.get("session")
+    if not session_token:
+        return None
+    
+    payload = state.oauth.jwt.decode_token(session_token)
+    if not payload or payload.scope != "session":
+        return None
+    
+    from auth import database as db
+    user = db.get_user_by_id(payload.sub)
+    if not user or not user.get("is_active"):
+        return None
+    
+    # Get or create API key for the user
+    from auth.database import list_api_keys, create_api_key
+    api_keys = list_api_keys(user["id"])
+    if not api_keys:
+        api_key = create_api_key(user["id"], "Default")
+    else:
+        api_key = api_keys[0]["key"]
+    
+    user["api_key"] = api_key
+    return user
+
+
+async def get_current_session_user(request: Request) -> Dict[str, Any]:
+    """FastAPI dependency: require authenticated session."""
+    user = get_user_from_session(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    return user
+
+
+@app.post("/auth/register", tags=["Auth"])
+async def register_user(req: UserRegisterRequest):
+    """Register a new user account."""
+    if len(req.password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+    
+    if not req.username or len(req.username) < 3:
+        raise HTTPException(status_code=400, detail="Username must be at least 3 characters")
+    
+    import re
+    if not re.match(r'^[a-zA-Z0-9_]+$', req.username):
+        raise HTTPException(status_code=400, detail="Username can only contain letters, numbers, and underscores")
+    
+    import secrets
+    user_id = f"usr_{secrets.token_urlsafe(12)}"
+    hashed_pw = hash_password(req.password)
+    
+    from auth import database as db
+    result = db.create_user(
+        user_id=user_id,
+        username=req.username,
+        hashed_password=hashed_pw,
+        email=req.email,
+    )
+    
+    if not result:
+        raise HTTPException(status_code=409, detail="Username or email already exists")
+    
+    return {
+        "user_id": user_id,
+        "username": req.username,
+        "email": req.email,
+    }
+
+
+@app.post("/auth/login", tags=["Auth"])
+async def login_user(req: UserLoginRequest, response: Response):
+    """Login and set session cookie."""
+    from auth import database as db
+    from fastapi.responses import JSONResponse
+    
+    user_data = db.get_user_by_username(req.username)
+    if not user_data:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    
+    if not user_data.get("is_active"):
+        raise HTTPException(status_code=403, detail="Account is deactivated")
+    
+    if not verify_password(req.password, user_data["hashed_password"]):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    
+    session_token = create_session_token(user_data["id"])
+    
+    # Get or create API key for user
+    from auth.database import list_api_keys, create_api_key
+    api_keys = list_api_keys(user_data["id"])
+    if not api_keys:
+        api_key = create_api_key(user_data["id"], "Default")
+    else:
+        api_key = api_keys[0]["key"]
+    
+    resp = JSONResponse(content={
+        "user_id": user_data["id"],
+        "username": user_data["username"],
+        "api_key": api_key,
+    })
+    resp.set_cookie(
+        key="session",
+        value=session_token,
+        httponly=True,
+        secure=False,
+        samesite="lax",
+        max_age=86400,
+        path="/",
+    )
+    return resp
+
+
+@app.post("/auth/logout", tags=["Auth"])
+async def logout_user(response: Response):
+    """Logout and clear session cookie, then redirect to login."""
+    resp = RedirectResponse(url="/auth/login", status_code=302)
+    resp.delete_cookie(key="session", path="/")
+    return resp
+
+
+@app.get("/auth/me", tags=["Auth"])
+async def get_me(user: Dict = Depends(get_current_session_user)):
+    """Get current user info."""
+    return {
+        "id": user["id"],
+        "username": user["username"],
+        "email": user.get("email"),
+    }
+
+
+@app.put("/auth/me", tags=["Auth"])
+async def update_me(
+    req: UserUpdateRequest,
+    user: Dict = Depends(get_current_session_user),
+):
+    """Update current user profile."""
+    from auth import database as db
+    
+    user_id = user["id"]
+    new_hashed_password = None
+    
+    if req.new_password:
+        if not req.current_password:
+            raise HTTPException(status_code=400, detail="Current password required to change password")
+        
+        user_data = db.get_user_by_id(user_id)
+        if not user_data or not verify_password(req.current_password, user_data.get("hashed_password", "")):
+            raise HTTPException(status_code=401, detail="Current password is incorrect")
+        
+        if len(req.new_password) < 8:
+            raise HTTPException(status_code=400, detail="New password must be at least 8 characters")
+        
+        new_hashed_password = hash_password(req.new_password)
+    
+    db.update_user(
+        user_id=user_id,
+        username=req.username,
+        email=req.email,
+        hashed_password=new_hashed_password,
+    )
+    
+    updated = db.get_user_by_id(user_id)
+    return {
+        "id": updated["id"],
+        "username": updated["username"],
+        "email": updated.get("email"),
+    }
+
+
+# -----------------------------------------------------------------------------
+# Web UI Routes
+# -----------------------------------------------------------------------------
+
+@app.get("/auth/login", tags=["Web UI"])
+async def login_page(request: Request):
+    """Login page."""
+    user = get_user_from_session(request)
+    if user:
+        return RedirectResponse(url="/app")
+    return render_template("login.html")
+
+
+@app.get("/auth/register", tags=["Web UI"])
+async def register_page(request: Request):
+    """Registration page."""
+    user = get_user_from_session(request)
+    if user:
+        return RedirectResponse(url="/app")
+    return render_template("register.html")
+
+
+@app.get("/app", tags=["Web UI"])
+async def dashboard_page(request: Request):
+    """Dashboard - shows home page for logged-in users, redirects to login otherwise."""
+    user = get_user_from_session(request)
+    if not user:
+        return RedirectResponse(url="/auth/login")
+    
+    app_state = _get_state()
+    
+    connectors_data = []
+    connected_count = 0
+    for conn in await app_state.connectors.list_connectors_async():
+        name = conn.get("name", "")
+        try:
+            token = await get_token_store().get_token(user["id"], name)
+            is_connected = token is not None
+        except Exception:
+            is_connected = False
+        if is_connected:
+            connected_count += 1
+        connectors_data.append({
+            "name": name,
+            "display_name": conn.get("display_name", name.title()),
+            "tools_count": len(conn.get("tools", [])),
+            "connected": is_connected,
+        })
+    
+    backends = app_state.backends.list_backends()
+    
+    return render_template(
+        "dashboard.html",
+        user=user,
+        connected_count=connected_count,
+        total_tools=sum(c["tools_count"] for c in connectors_data),
+        api_keys_count=0,
+        backends_count=len([b for b in backends if b.get("status") == "healthy"]),
+        connectors=connectors_data,
+    )
+
+
+@app.get("/connectors", tags=["Web UI"])
+async def connectors_page(request: Request):
+    """Connectors management page."""
+    user = get_user_from_session(request)
+    if not user:
+        return RedirectResponse(url="/auth/login")
+    
+    app_state = _get_state()
+    
+    connectors_data = []
+    for conn in await app_state.connectors.list_connectors_async():
+        name = conn.get("name", "")
+        try:
+            token = await get_token_store().get_token(user["id"], name)
+            is_connected = token is not None
+        except Exception:
+            is_connected = False
+        connectors_data.append({
+            "name": name,
+            "display_name": conn.get("display_name", name.title()),
+            "description": conn.get("description", ""),
+            "tools_count": len(conn.get("tools", [])),
+            "connected": is_connected,
+            "connected_as": None,
+        })
+    
+    return render_template(
+        "connectors.html",
+        user=user,
+        connectors=connectors_data,
+    )
+
+
+@app.post("/connectors/{connector_name}/disconnect", tags=["Web UI"])
+async def disconnect_connector(connector_name: str, request: Request):
+    """Disconnect a connector for the current user."""
+    user = get_user_from_session(request)
+    if not user:
+        return RedirectResponse(url="/auth/login")
+    
+    await get_token_store().delete_token(user["id"], connector_name)
+    return RedirectResponse(url=f"/connectors/{connector_name}", status_code=303)
+
+
+@app.get("/connectors/{connector_name}", tags=["Web UI"])
+async def connector_detail_page(connector_name: str, request: Request):
+    """Connector detail page showing prompts, resources, and tools."""
+    user = get_user_from_session(request)
+    if not user:
+        return RedirectResponse(url="/auth/login")
+    
+    app_state = _get_state()
+    
+    # Find the connector
+    conn = None
+    for c in app_state.connectors.list_connectors():
+        if c.get("name") == connector_name:
+            conn = c
+            break
+    
+    if not conn:
+        raise HTTPException(status_code=404, detail="Connector not found")
+    
+    # Check if connected for this user
+    try:
+        token = await get_token_store().get_token(user["id"], connector_name)
+        is_connected = token is not None
+    except Exception:
+        is_connected = False
+    
+    # Get detailed connector info
+    connector_obj = app_state.connectors.get_connector(connector_name)
+    tools = []
+    resources = []
+    prompts = []
+    
+    if connector_obj:
+        # Get tools (try async first, then sync)
+        try:
+            if hasattr(connector_obj, "get_tools_async"):
+                tools = await connector_obj.get_tools_async()
+            else:
+                tools = connector_obj.get_tools()
+        except Exception:
+            tools = connector_obj.get_tools()
+        
+        tools_data = []
+        for tool in tools:
+            tools_data.append({
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.parameters,
+            })
+        tools = tools_data
+        
+        # Get resources if available
+        if hasattr(connector_obj, "get_resources"):
+            for resource in connector_obj.get_resources():
+                resources.append({
+                    "uri": resource.uri,
+                    "name": resource.name,
+                    "description": resource.description,
+                    "mime_type": resource.mime_type,
+                })
+        
+        # Get prompts if available
+        if hasattr(connector_obj, "get_prompts"):
+            for prompt in connector_obj.get_prompts():
+                prompts.append({
+                    "name": prompt.name,
+                    "description": prompt.description,
+                    "arguments": prompt.arguments,
+                })
+    
+    return render_template(
+        "connector_detail.html",
+        user=user,
+        connector={
+            "name": connector_name,
+            "display_name": conn.get("display_name", connector_name.title()),
+            "description": conn.get("description", ""),
+            "tools": tools,
+            "resources": resources,
+            "prompts": prompts,
+            "connected": is_connected,
+            "healthy": conn.get("healthy", False),
+            "total_calls": conn.get("total_calls", 0),
+            "total_errors": conn.get("total_errors", 0),
+        },
+        api_key=user.get("api_key"),  # Pass user's primary API key
+    )
+
+
+@app.get("/api-keys", tags=["Web UI"])
+async def api_keys_page(request: Request):
+    """API keys management page."""
+    user = get_user_from_session(request)
+    if not user:
+        return RedirectResponse(url="/auth/login")
+    
+    # Get user's API keys from database
+    from auth.database import list_api_keys
+    api_keys = list_api_keys(user["id"])
+    primary_api_key = api_keys[0]["key"] if api_keys else None
+    
+    return render_template(
+        "api_keys.html",
+        user=user,
+        api_keys=api_keys,
+        primary_api_key=primary_api_key,
+    )
+
+
+@app.post("/api-keys/create", tags=["Web UI"])
+async def create_api_key_action(request: Request):
+    """Create a new API key for the user."""
+    user = get_user_from_session(request)
+    if not user:
+        return RedirectResponse(url="/auth/login")
+    
+    # Parse form data
+    form = await request.form()
+    key_name = form.get("name", "My API Key")
+    
+    # Create API key
+    from auth.database import create_api_key
+    new_key = create_api_key(user["id"], key_name)
+    
+    # Store in session temporarily for display
+    request.session["new_api_key"] = new_key
+    
+    return RedirectResponse(url="/api-keys?show_key=1")
+
+
+@app.post("/api-keys/{key}/revoke", tags=["Web UI"])
+async def revoke_api_key(key: str, request: Request):
+    """Revoke an API key."""
+    user = get_user_from_session(request)
+    if not user:
+        return RedirectResponse(url="/auth/login")
+    
+    from auth.database import delete_api_key
+    delete_api_key(user["id"], key)
+    
+    return RedirectResponse(url="/api-keys")
+
+
+@app.get("/api-keys/{client_id}", tags=["Web UI"])
+async def api_key_detail_page(client_id: str, request: Request):
+    """API key detail page."""
+    user = get_user_from_session(request)
+    if not user:
+        return RedirectResponse(url="/auth/login")
+    
+    app_state = _get_state()
+    client = app_state.oauth.get_client(client_id)
+    
+    if not client:
+        raise HTTPException(status_code=404, detail="API key not found")
+    
+    return render_template(
+        "api_key_detail.html",
+        user=user,
+        api_key={
+            "client_id": client.client_id,
+            "client_name": client.client_name,
+            "redirect_uris": client.redirect_uris,
+            "is_confidential": client.is_confidential,
+        },
+    )
+
+
+@app.get("/settings", tags=["Web UI"])
+async def settings_page(request: Request):
+    """User settings page."""
+    user = get_user_from_session(request)
+    if not user:
+        return RedirectResponse(url="/auth/login")
+    
+    return render_template(
+        "settings.html",
+        user=user,
+    )
+
+
+@app.get("/", tags=["Web UI"])
+async def root_redirect(request: Request):
+    """Root path redirects to dashboard if logged in, otherwise to login."""
+    user = get_user_from_session(request)
+    if user:
+        return RedirectResponse(url="/app")
+    return RedirectResponse(url="/auth/login"    )
+
+
+@app.get("/backends", tags=["Web UI"])
+async def backends_page(request: Request):
+    """Backends management page."""
+    user = get_user_from_session(request)
+    if not user:
+        return RedirectResponse(url="/auth/login")
+    
+    app_state = _get_state()
+    backends = app_state.backends.list_backends()
+    
+    return render_template(
+        "backends.html",
+        user=user,
+        backends=backends,
+    )
+
+
+@app.get("/backends/{backend_id}", tags=["Web UI"])
+async def backend_detail_page(backend_id: str, request: Request):
+    """Backend detail page."""
+    user = get_user_from_session(request)
+    if not user:
+        return RedirectResponse(url="/auth/login")
+    
+    app_state = _get_state()
+    backends = app_state.backends.list_backends()
+    
+    backend = None
+    for b in backends:
+        if b["id"] == backend_id:
+            backend = b
+            break
+    
+    if not backend:
+        raise HTTPException(status_code=404, detail="Backend not found")
+    
+    return render_template(
+        "backend_detail.html",
+        user=user,
+        backend=backend,
+    )
+
+
+@app.get("/api/info", tags=["Info"])
+async def api_info():
+    """Gateway info endpoint (API only)."""
     app_state = _get_state()
     return {
         "name": app_state.config.server.server_name,
@@ -771,8 +1386,9 @@ async def discover_tools():
     Returns tools in OpenAI-compatible format for easy SDK integration.
     Used by CLIs and SDKs to discover available tools before authentication.
     """
-    backend_tools = state.backends.list_tools()
-    connector_tools = state.connectors.get_all_tools()
+    app_state = _get_state()
+    backend_tools = app_state.backends.list_tools()
+    connector_tools = app_state.connectors.get_all_tools()
     
     # Format in OpenAI-compatible tool format
     all_tools = []
@@ -1022,10 +1638,60 @@ async def v1_batch_call(
     }
 
 
-@app.get("/mcp/connectors", tags=["MCP Compatible"])
-async def list_connectors(user: Dict = Depends(get_current_user)):
-    """List all registered connectors and their status."""
-    return state.connectors.list_connectors()
+@app.api_route("/user-mcp/{api_key}/{connector_name}/mcp", methods=["GET", "POST"], tags=["MCP Compatible"])
+async def per_user_mcp_endpoint(
+    api_key: str,
+    connector_name: str,
+    request: Request,
+):
+    """
+    Per-user MCP endpoint using API key authentication.
+    
+    The API key is in the URL path, identifying the user.
+    Forwards to the pre-mounted MCP server at /mcp/{connector_name}.
+    
+    Example: /user-mcp/relay_abc123/github/mcp
+    """
+    from auth.database import get_api_key, update_api_key_last_used
+    
+    # Validate API key
+    key_data = get_api_key(api_key)
+    if not key_data:
+        return JSONResponse(status_code=401, content={"error": "Invalid API key"})
+    
+    user_id = key_data["user_id"]
+    
+    # Update last used
+    update_api_key_last_used(api_key)
+    
+    # Find the mounted connector MCP server
+    mount_path = f"/mcp/{connector_name}"
+    mounted_app = None
+    
+    # Routes are of type Mount for mounted apps
+    from starlette.routing import Mount
+    for route in app.routes:
+        if isinstance(route, Mount) and route.path == mount_path:
+            mounted_app = route.app
+            break
+    
+    if mounted_app is None:
+        return JSONResponse(status_code=404, content={"error": f"Connector MCP server not mounted: {connector_name}"})
+    
+    # Modify scope: replace /user-mcp/{api_key}/{connector}/mcp with /mcp
+    scope = dict(request.scope)
+    scope["path"] = "/mcp"
+    
+    # Add user_id header for the MCP server to use
+    new_headers = [(k, v) for k, v in scope.get("headers", [])]
+    new_headers.append((b"x-user-id", user_id.encode()))
+    scope["headers"] = new_headers
+    
+    # Forward to the mounted MCP server
+    await mounted_app(scope, request.receive, request._send)
+    
+    # Return empty response (the ASGI app has already sent the response)
+    return Response(content="")
 
 
 @app.post("/mcp/connectors/{connector_name}/health", tags=["MCP Compatible"])
@@ -1284,18 +1950,21 @@ async def connectors_page(
 
 
 @app.get("/oauth/authorize/{connector}", tags=["OAuth"])
-async def oauth_authorize(connector: str):
+async def oauth_authorize(connector: str, request: Request):
     """
     Start OAuth flow for a connector.
     
     Redirects to the service's OAuth authorization page.
+    Binds the flow to the currently logged-in user.
     """
     app_state = _get_state()
     
     if connector not in CONNECTOR_OAUTH_CONFIGS:
         raise HTTPException(status_code=404, detail=f"Unknown connector: {connector}")
     
-    # Check if OAuth is configured
+    relay_user = get_user_from_session(request)
+    relay_user_id = relay_user["id"] if relay_user else None
+    
     if connector == "github":
         if not app_state.config.github_oauth.client_id:
             return HTMLResponse(
@@ -1307,7 +1976,7 @@ async def oauth_authorize(connector: str):
                 status_code=501,
             )
         auth_url = app_state.connector_oauth.get_github_auth_url(
-            state=app_state.connector_oauth.create_state(connector)
+            state=app_state.connector_oauth.create_state(connector, user_id=relay_user_id)
         )
     elif connector == "slack":
         if not app_state.config.slack_oauth.client_id:
@@ -1320,7 +1989,7 @@ async def oauth_authorize(connector: str):
                 status_code=501,
             )
         auth_url = app_state.connector_oauth.get_slack_auth_url(
-            state=app_state.connector_oauth.create_state(connector)
+            state=app_state.connector_oauth.create_state(connector, user_id=relay_user_id)
         )
     elif connector == "linear":
         if not app_state.config.linear_oauth.client_id:
@@ -1333,7 +2002,7 @@ async def oauth_authorize(connector: str):
                 status_code=501,
             )
         auth_url = app_state.connector_oauth.get_linear_auth_url(
-            state=app_state.connector_oauth.create_state(connector)
+            state=app_state.connector_oauth.create_state(connector, user_id=relay_user_id)
         )
     else:
         raise HTTPException(status_code=404, detail=f"Unknown connector: {connector}")
@@ -1342,11 +2011,10 @@ async def oauth_authorize(connector: str):
 
 
 @app.get("/oauth/github/callback", tags=["OAuth"])
-async def github_callback(code: str, state: str):
+async def github_callback(code: str, state: str = None):
     """Handle GitHub OAuth callback."""
     app_state = _get_state()
     
-    # Validate state
     state_data = app_state.connector_oauth.validate_state(state)
     if not state_data:
         return HTMLResponse(
@@ -1354,7 +2022,6 @@ async def github_callback(code: str, state: str):
             status_code=400,
         )
     
-    # Exchange code for token
     oauth_user = await app_state.connector_oauth.exchange_github_code(code)
     if not oauth_user:
         return HTMLResponse(
@@ -1362,23 +2029,18 @@ async def github_callback(code: str, state: str):
             status_code=400,
         )
     
-    # Store token (using user ID from OAuth)
-    user_id = oauth_user.id
-    app_state.connector_oauth.store_token("github", user_id, oauth_user)
+    relay_user_id = state_data.get("user_id") or oauth_user.id
     
-    # Store in the main token store
-    # Store with both GitHub user ID and a common "default" key for easy lookup
+    app_state.connector_oauth.store_token("github", relay_user_id, oauth_user)
+    
     await get_token_store().set_token(
-        user_id=user_id,
+        user_id=relay_user_id,
         connector_name="github",
         token=oauth_user.access_token,
     )
-    # Also store with a default key for users without established JWT identity
-    await get_token_store().set_token(
-        user_id="default",
-        connector_name="github",
-        token=oauth_user.access_token,
-    )
+    
+    # Update connector with user's token and run health check
+    await app_state.connectors.set_user_token_and_check("github", oauth_user.access_token)
     
     return HTMLResponse(content=f"""<!DOCTYPE html>
 <html>
@@ -1402,7 +2064,7 @@ async def github_callback(code: str, state: str):
 
 
 @app.get("/oauth/slack/callback", tags=["OAuth"])
-async def slack_callback(code: str, state: str):
+async def slack_callback(code: str, state: str = None):
     """Handle Slack OAuth callback."""
     app_state = _get_state()
     
@@ -1420,8 +2082,17 @@ async def slack_callback(code: str, state: str):
             status_code=400,
         )
     
-    user_id = oauth_user.id
-    app_state.connector_oauth.store_token("slack", user_id, oauth_user)
+    relay_user_id = state_data.get("user_id") or oauth_user.id
+    app_state.connector_oauth.store_token("slack", relay_user_id, oauth_user)
+    
+    await get_token_store().set_token(
+        user_id=relay_user_id,
+        connector_name="slack",
+        token=oauth_user.access_token,
+    )
+    
+    # Update connector with user's token and run health check
+    await app_state.connectors.set_user_token_and_check("slack", oauth_user.access_token)
     
     return HTMLResponse(content=f"""<!DOCTYPE html>
 <html>
@@ -1437,7 +2108,7 @@ async def slack_callback(code: str, state: str):
 
 
 @app.get("/oauth/linear/callback", tags=["OAuth"])
-async def linear_callback(code: str, state: str):
+async def linear_callback(code: str, state: str = None):
     """Handle Linear OAuth callback."""
     app_state = _get_state()
     
@@ -1455,8 +2126,17 @@ async def linear_callback(code: str, state: str):
             status_code=400,
         )
     
-    user_id = oauth_user.id
-    app_state.connector_oauth.store_token("linear", user_id, oauth_user)
+    relay_user_id = state_data.get("user_id") or oauth_user.id
+    app_state.connector_oauth.store_token("linear", relay_user_id, oauth_user)
+    
+    await get_token_store().set_token(
+        user_id=relay_user_id,
+        connector_name="linear",
+        token=oauth_user.access_token,
+    )
+    
+    # Update connector with user's token and run health check
+    await app_state.connectors.set_user_token_and_check("linear", oauth_user.access_token)
     
     return HTMLResponse(content=f"""<!DOCTYPE html>
 <html>
@@ -1785,7 +2465,17 @@ def create_connector_mcp_server(
         logger.error(f"Connector '{connector_name}' not found")
         return None
 
-    tools = connector.get_tools()
+    tools = []
+    if hasattr(connector, "get_tools_async"):
+        try:
+            import asyncio
+            tools = asyncio.get_event_loop().run_until_complete(connector.get_tools_async())
+        except Exception as e:
+            logger.warning(f"Async tool discovery failed for '{connector_name}': {e}")
+            tools = connector.get_tools()
+    else:
+        tools = connector.get_tools()
+    
     if not tools:
         logger.warning(f"Connector '{connector_name}' has no tools")
         return None
@@ -1793,7 +2483,6 @@ def create_connector_mcp_server(
     mcp = FastMCP(
         f"gateway-{connector_name}",
         instructions=f"{connector.display_name}: {connector.description}",
-        stateless_http=True,
     )
 
     for tool_def in tools:
@@ -1821,40 +2510,59 @@ async def tool_fn({params_str}) -> str:
     _tool_param_names = {list(schema_params.keys())}
     kwargs = {{k: v for k, v in locals().items() if k in _tool_param_names and v is not None}}
 
+    # Try to get authorization from MCP request context
     auth_val = None
+    api_key = None
+    user_id = None
     try:
         if ctx is not None and ctx.request_context is not None:
             req = ctx.request_context.request
             if req is not None:
                 auth_val = req.headers.get("Authorization")
+                api_key = req.headers.get("X-API-Key")
+                user_id = req.headers.get("X-User-Id")
     except Exception:
         pass
 
-    requires_auth = {tool_def.requires_auth}
-    if requires_auth and auth_val:
+    user_token = None
+    
+    # First try X-User-Id header (set by per-user MCP endpoint)
+    if user_id:
+        try:
+            from auth.token_store import get_token_store
+            user_token = await get_token_store().get_token(user_id, "{connector_name}")
+        except Exception:
+            pass
+    
+    # Then try API key header
+    if not user_token and api_key:
+        try:
+            from auth.database import get_api_key
+            key_data = get_api_key(api_key)
+            if key_data:
+                user_id = key_data["user_id"]
+                from auth.token_store import get_token_store
+                user_token = await get_token_store().get_token(user_id, "{connector_name}")
+        except Exception:
+            pass
+    
+    # Then try JWT auth
+    if not user_token and auth_val:
         token = auth_val[7:] if auth_val.startswith("Bearer ") else auth_val
         user_info = app_state.oauth.validate_access_token(token)
-    elif requires_auth:
-        user_info = None
-    else:
-        user_info = {{"user_id": "anonymous"}}
+        if user_info:
+            user_id = user_info.get("user_id")
+            try:
+                from auth.token_store import get_token_store
+                user_token = await get_token_store().get_token(user_id, "{connector_name}")
+            except Exception:
+                pass
 
-    if requires_auth and not user_info:
-        return json.dumps({{"error": f"Authentication required for '{tool_name}'"}})
-
-    user_id = user_info.get("user_id") if user_info else None
-    user_token = None
-
-    if user_id and requires_auth:
-        from auth.token_store import get_token_store
-        user_token = await get_token_store().get_token(user_id, "{connector_name}")
-        if not user_token:
-            user_token = await get_token_store().get_token("default", "{connector_name}")
-
+    requires_auth = {tool_def.requires_auth}
     if requires_auth and not user_token:
         return json.dumps({{
             "error": f"No credentials for '{connector_name}'",
-            "hint": f"Store a token via POST /v1/tokens or visit /oauth/authorize/{connector_name}",
+            "hint": "Connect your account at http://localhost:8000/oauth/authorize/{connector_name}",
         }})
 
     success, result = await app_state.connectors.call_tool(
@@ -1886,10 +2594,195 @@ async def tool_fn({params_str}) -> str:
 
         mcp.tool()(tool_fn)
 
+    # Add resources
+    resources = connector.get_resources()
+    for resource in resources:
+        resource_uri = resource.uri
+        resource_name = resource.name
+        resource_desc = resource.description
+        
+        @mcp.resource(resource_uri)
+        async def resource_handler() -> str:
+            result = await connector.read_resource(resource_uri)
+            return json.dumps(result) if result else "{}"
+        
+        resource_handler.__name__ = resource_name
+        resource_handler.__doc__ = resource_desc
+    
+    # Add prompts
+    prompts = connector.get_prompts()
+    for prompt in prompts:
+        prompt_name = prompt.name
+        prompt_desc = prompt.description
+        prompt_template = prompt.template
+        
+        @mcp.prompt(name=prompt_name)
+        def prompt_handler(**kwargs) -> str:
+            result = prompt_template
+            for key, value in kwargs.items():
+                result = result.replace(f"{{{key}}}", str(value))
+            return result
+        
+        prompt_handler.__doc__ = prompt_desc
+    
     return mcp
 
 
-def create_proxy_mcp_server(backend_id: str = "github") -> Optional[Any]:
+def create_connector_mcp_server_with_auth(
+    connector_name: str,
+    user_token: Optional[str] = None,
+    app_state: Optional["AppState"] = None,
+) -> Optional[Any]:
+    """
+    Create an MCP server for a specific user with pre-fetched token.
+    
+    The server uses the provided user_token to make tool calls.
+    
+    Args:
+        connector_name: Name of the connector (e.g. "github", "slack")
+        user_token: The pre-fetched user token for this connector
+        app_state: Application state. If None, uses global state.
+    """
+    try:
+        from mcp.server.fastmcp import FastMCP
+    except ImportError:
+        logger.error("MCP SDK not installed. Run: pip install mcp")
+        return None
+
+    if app_state is None:
+        app_state = state
+
+    if app_state is None:
+        logger.error("Cannot create connector MCP server: app_state is None")
+        return None
+
+    connector = app_state.connectors.get_connector(connector_name)
+    if connector is None:
+        logger.error(f"Connector '{connector_name}' not found")
+        return None
+
+    tools = []
+    if hasattr(connector, "get_tools_async"):
+        try:
+            import asyncio
+            tools = asyncio.get_event_loop().run_until_complete(connector.get_tools_async())
+        except Exception as e:
+            logger.warning(f"Async tool discovery failed for '{connector_name}': {e}")
+            tools = connector.get_tools()
+    else:
+        tools = connector.get_tools()
+    
+    if not tools:
+        logger.warning(f"Connector '{connector_name}' has no tools")
+        return None
+
+    mcp = FastMCP(
+        f"gateway-{connector_name}",
+        instructions=f"{connector.display_name}: {connector.description}",
+    )
+
+    # Use the provided user_token (already fetched in the endpoint)
+    # This avoids async event loop issues
+
+    for tool_def in tools:
+        tool_name = tool_def.name
+        tool_desc = tool_def.description
+        tool_params = tool_def.parameters
+
+        schema_params = tool_params.get("properties", {})
+        required = tool_params.get("required", [])
+
+        params = []
+        for pname in schema_params:
+            if pname in required:
+                params.append(f"{pname}: str")
+        for pname in schema_params:
+            if pname not in required:
+                params.append(f"{pname}: Optional[str] = None")
+        if params:
+            params_str = ", ".join(params) + ", ctx: Context = None"
+        else:
+            params_str = "ctx: Context = None"
+
+        # Capture user_token in closure
+        _user_token = user_token
+        _connector_name = connector_name
+
+        fn_code = f"""
+async def tool_fn({params_str}) -> str:
+    _tool_param_names = {list(schema_params.keys())}
+    kwargs = {{k: v for k, v in locals().items() if k in _tool_param_names and v is not None}}
+
+    user_token = "{_user_token or ''}"
+    
+    if not user_token:
+        return json.dumps({{
+            "error": f"No credentials for '{_connector_name}'",
+            "hint": "Connect your account at http://localhost:8000/oauth/authorize/{_connector_name}",
+        }})
+
+    success, result = await app_state.connectors.call_tool(
+        tool_name="{tool_name}",
+        arguments=kwargs,
+        user_token=user_token,
+    )
+
+    if not success:
+        return json.dumps({{"error": result}})
+    return json.dumps({{"result": result}})
+"""
+        local_ns: Dict[str, Any] = {
+            "app_state": app_state,
+            "json": json,
+            "Optional": Optional,
+            "Context": None,
+            "asyncio": asyncio,
+        }
+        try:
+            from mcp.server.fastmcp import Context
+            local_ns["Context"] = Context
+        except ImportError:
+            pass
+
+        exec(fn_code, local_ns, local_ns)
+        tool_fn = local_ns["tool_fn"]
+        tool_fn.__name__ = tool_name
+        tool_fn.__doc__ = tool_desc
+
+        mcp.tool()(tool_fn)
+
+    # Add resources
+    resources = connector.get_resources()
+    for resource in resources:
+        resource_uri = resource.uri
+        resource_name = resource.name
+        resource_desc = resource.description
+        
+        @mcp.resource(resource_uri)
+        async def resource_handler() -> str:
+            result = await connector.read_resource(resource_uri)
+            return json.dumps(result) if result else "{}"
+        
+        resource_handler.__name__ = resource_name
+        resource_handler.__doc__ = resource_desc
+    
+    # Add prompts
+    prompts = connector.get_prompts()
+    for prompt in prompts:
+        prompt_name = prompt.name
+        prompt_desc = prompt.description
+        prompt_template = prompt.template
+        
+        @mcp.prompt(name=prompt_name)
+        def prompt_handler(**kwargs) -> str:
+            result = prompt_template
+            for key, value in kwargs.items():
+                result = result.replace(f"{{{key}}}", str(value))
+            return result
+        
+        prompt_handler.__doc__ = prompt_desc
+    
+    return mcp
     """
     Create an MCP server that proxies directly to a specific MCP backend.
     

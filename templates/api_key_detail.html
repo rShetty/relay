@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% set show_sidebar = true %}
+{% set active_page = "api-keys" %}
+{% block page_title %}API Key Details{% endblock %}
+{% block content %}
+<div class="detail-header">
+    <div class="detail-header-info">
+        <div class="connector-icon-large">🔑</div>
+        <div>
+            <h1>{{ api_key.client_name }}</h1>
+            <p class="connector-desc">API Key Detail</p>
+        </div>
+    </div>
+    <div class="detail-actions">
+        <form action="/api-keys/{{ api_key.client_id }}/revoke" method="post">
+            <button type="submit" class="btn btn-danger" onclick="return confirm('Revoke this API key?')">Revoke Key</button>
+        </form>
+    </div>
+</div>
+
+<div class="detail-section">
+    <h2>Details</h2>
+    <div class="detail-grid">
+        <div class="detail-item">
+            <label>Client ID</label>
+            <code>{{ api_key.client_id }}</code>
+        </div>
+        <div class="detail-item">
+            <label>Type</label>
+            <span>{{ 'Confidential' if api_key.is_confidential else 'Public' }}</span>
+        </div>
+        <div class="detail-item">
+            <label>Redirect URIs</label>
+            <ul class="uri-list">
+                {% for uri in api_key.redirect_uris %}
+                <li><code>{{ uri }}</code></li>
+                {% endfor %}
+            </ul>
+        </div>
+    </div>
+</div>
+{% endblock %}

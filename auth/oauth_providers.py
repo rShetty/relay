@@ -27,6 +27,7 @@ class OAuthUser:
     access_token: str
     refresh_token: Optional[str] = None
     expires_at: Optional[datetime] = None
+    login: Optional[str] = None
 
 
 class OAuthProvider:
@@ -119,6 +120,7 @@ class OAuthProvider:
                     name=user_data.get("name"),
                     email=email,
                     access_token=access_token,
+                    login=user_data.get("login"),
                 )
             except Exception:
                 pass
@@ -244,28 +246,49 @@ class OAuthProvider:
     # -------------------------------------------------------------------------
     
     def create_state(self, connector: str, user_id: Optional[str] = None) -> str:
-        """Create a new OAuth state."""
+        """Create a new OAuth state and persist to database."""
         state = secrets.token_urlsafe(32)
+        
+        # Also keep in-memory for quick access during same process lifetime
         self._states[state] = {
             "connector": connector,
             "user_id": user_id,
             "created_at": datetime.now(timezone.utc),
         }
+        
+        # Persist to database
+        from auth import database as db
+        db.create_oauth_state(state, connector, user_id)
+        
         return state
     
     def validate_state(self, state: str) -> Optional[Dict[str, Any]]:
-        """Validate and consume an OAuth state."""
-        if state not in self._states:
-            return None
+        """Validate and consume an OAuth state from database."""
+        # Always check database first (persisted across restarts)
+        from auth import database as db
+        state_data = db.get_oauth_state(state)
         
-        state_data = self._states[state]
-        created = state_data["created_at"]
+        if state_data:
+            # Also clean up in-memory if exists
+            if state in self._states:
+                del self._states[state]
+            # Delete from database after use
+            db.delete_oauth_state(state)
+            return state_data
         
-        if datetime.now(timezone.utc) - created > timedelta(minutes=10):
+        # Fallback: check in-memory (for same-process flows)
+        if state in self._states:
+            state_data = self._states[state]
+            created = state_data["created_at"]
+            
+            if datetime.now(timezone.utc) - created > timedelta(minutes=10):
+                del self._states[state]
+                return None
+            
             del self._states[state]
-            return None
+            return state_data
         
-        return state_data
+        return None
     
     # -------------------------------------------------------------------------
     # Token Management

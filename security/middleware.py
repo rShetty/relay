@@ -25,6 +25,8 @@ from datetime import datetime, timedelta, timezone
 from functools import wraps
 from typing import Any, Callable, Dict, List, Optional, Set, TYPE_CHECKING
 
+from starlette.middleware.base import BaseHTTPMiddleware
+
 if TYPE_CHECKING:
     from fastapi import Request
 
@@ -595,3 +597,20 @@ class SecurityContext:
                     "result_summary": result_summary,
                 },
             )
+
+
+class HSTSMiddleware(BaseHTTPMiddleware):
+    """Add HTTP Strict-Transport-Security header to all responses."""
+
+    def __init__(self, app, max_age: int = 31536000, include_subdomains: bool = True):
+        super().__init__(app)
+        self.max_age = max_age
+        self.include_subdomains = include_subdomains
+
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        hsts_value = f"max-age={self.max_age}"
+        if self.include_subdomains:
+            hsts_value += "; includeSubDomains"
+        response.headers["strict-transport-security"] = hsts_value
+        return response

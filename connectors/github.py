@@ -45,6 +45,27 @@ class ToolDefinition:
     requires_auth: bool = True
 
 
+@dataclass
+class ResourceDefinition:
+    """Definition of a resource provided by a connector."""
+    uri: str  # e.g., "github://repos" or "github://repos/owner/repo"
+    name: str
+    description: str
+    mime_type: str = "application/json"
+    read_handler: Optional[Callable] = None
+    requires_auth: bool = True
+
+
+@dataclass
+class PromptDefinition:
+    """Definition of a prompt template provided by a connector."""
+    name: str
+    description: str
+    arguments: List[Dict[str, Any]] = field(default_factory=list)
+    template: str = ""
+    requires_auth: bool = True
+
+
 @dataclass 
 class ConnectorConfig:
     """Configuration for a connector."""
@@ -109,7 +130,19 @@ class BaseConnector(ABC):
     def get_tools(self) -> List[ToolDefinition]:
         """Return list of tools provided by this connector."""
         pass
-
+    
+    def get_resources(self) -> List[ResourceDefinition]:
+        """Return list of resources provided by this connector."""
+        return []
+    
+    def get_prompts(self) -> List[PromptDefinition]:
+        """Return list of prompt templates provided by this connector."""
+        return []
+    
+    async def read_resource(self, uri: str) -> Optional[Dict[str, Any]]:
+        """Read a resource by URI. Returns None if resource not found."""
+        return None
+    
     @abstractmethod
     async def health_check(self) -> Tuple[bool, str]:
         """Check if the service is accessible."""
@@ -186,9 +219,195 @@ class GitHubConnector(BaseConnector):
     display_name = "GitHub"
     description = "GitHub API for repositories, issues, PRs, and code"
     
+    TOOL_MAPPING = {
+        "search_repositories": {
+            "name": "github_search_repositories",
+            "description": "Search GitHub repositories",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query"},
+                    "sort": {"type": "string", "enum": ["stars", "forks", "updated"], "default": "best-match"},
+                    "order": {"type": "string", "enum": ["asc", "desc"], "default": "desc"},
+                    "limit": {"type": "integer", "default": 10, "maximum": 100},
+                },
+                "required": ["query"],
+            },
+            "handler": "_search_repositories",
+        },
+        "get_repository": {
+            "name": "github_get_repository",
+            "description": "Get details of a GitHub repository",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "owner": {"type": "string", "description": "Repository owner"},
+                    "repo": {"type": "string", "description": "Repository name"},
+                },
+                "required": ["owner", "repo"],
+            },
+            "handler": "_get_repository",
+        },
+        "list_issues": {
+            "name": "github_list_issues",
+            "description": "List issues in a repository",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "owner": {"type": "string"},
+                    "repo": {"type": "string"},
+                    "state": {"type": "string", "enum": ["open", "closed", "all"], "default": "open"},
+                    "labels": {"type": "string", "description": "Comma-separated label names"},
+                    "limit": {"type": "integer", "default": 30},
+                },
+                "required": ["owner", "repo"],
+            },
+            "handler": "_list_issues",
+        },
+        "create_issue": {
+            "name": "github_create_issue",
+            "description": "Create a new issue in a repository",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "owner": {"type": "string"},
+                    "repo": {"type": "string"},
+                    "title": {"type": "string"},
+                    "body": {"type": "string"},
+                    "labels": {"type": "array", "items": {"type": "string"}},
+                    "assignees": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["owner", "repo", "title"],
+            },
+            "handler": "_create_issue",
+        },
+        "list_pull_requests": {
+            "name": "github_list_pull_requests",
+            "description": "List pull requests in a repository",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "owner": {"type": "string"},
+                    "repo": {"type": "string"},
+                    "state": {"type": "string", "enum": ["open", "closed", "all"], "default": "open"},
+                    "limit": {"type": "integer", "default": 30},
+                },
+                "required": ["owner", "repo"],
+            },
+            "handler": "_list_pull_requests",
+        },
+        "create_pull_request": {
+            "name": "github_create_pull_request",
+            "description": "Create a new pull request",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "owner": {"type": "string"},
+                    "repo": {"type": "string"},
+                    "title": {"type": "string"},
+                    "body": {"type": "string"},
+                    "head": {"type": "string", "description": "The name of the branch where your changes are implemented"},
+                    "base": {"type": "string", "description": "The name of the branch you want the changes pulled into"},
+                },
+                "required": ["owner", "repo", "title", "head", "base"],
+            },
+            "handler": "_create_pull_request",
+        },
+        "get_file_content": {
+            "name": "github_get_file_content",
+            "description": "Get the content of a file in a repository",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "owner": {"type": "string"},
+                    "repo": {"type": "string"},
+                    "path": {"type": "string", "description": "Path to the file"},
+                    "ref": {"type": "string", "description": "Branch or tag name"},
+                },
+                "required": ["owner", "repo", "path"],
+            },
+            "handler": "_get_file_contents",
+        },
+        "list_user_repos": {
+            "name": "github_list_user_repositories",
+            "description": "List repositories for a user",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "username": {"type": "string"},
+                    "sort": {"type": "string", "enum": ["created", "updated", "pushed", "full_name"], "default": "full_name"},
+                    "per_page": {"type": "integer", "default": 30},
+                },
+                "required": ["username"],
+            },
+            "handler": "_list_user_repos",
+        },
+    }
+    
+    RESOURCE_MAPPING = {
+        "repos": {
+            "uri": "github://repos",
+            "name": "Repositories",
+            "description": "List repositories accessible to the user",
+            "handler": "_list_repos_resource",
+        },
+        "user": {
+            "uri": "github://user",
+            "name": "Current User",
+            "description": "Get current user profile",
+            "handler": "_get_user_resource",
+        },
+        "rate_limit": {
+            "uri": "github://rate_limit",
+            "name": "Rate Limit",
+            "description": "Get current API rate limit status",
+            "handler": "_get_rate_limit_resource",
+        },
+    }
+    
+    PROMPT_MAPPING = {
+        "create_issue": {
+            "name": "Create GitHub Issue",
+            "description": "Template for creating a GitHub issue",
+            "arguments": [
+                {"name": "owner", "description": "Repository owner"},
+                {"name": "repo", "description": "Repository name"},
+                {"name": "title", "description": "Issue title"},
+                {"name": "body", "description": "Issue description"},
+            ],
+            "template": """Create a GitHub issue in {owner}/{repo}:
+
+Title: {title}
+Body:
+{body}
+
+Use the github_create_issue tool to create this issue.""",
+        },
+        "summarize_pr": {
+            "name": "Summarize Pull Request",
+            "description": "Template for summarizing a PR",
+            "arguments": [
+                {"name": "owner", "description": "Repository owner"},
+                {"name": "repo", "description": "Repository name"},
+                {"name": "pr_number", "description": "PR number"},
+            ],
+            "template": """Summarize pull request #{pr_number} in {owner}/{repo}:
+
+1. What is this PR trying to accomplish?
+2. What are the key changes?
+3. Any concerns or things to watch for?
+
+Use github_list_pull_requests to get the PR details.""",
+        },
+    }
+    
     def __init__(self, config: ConnectorConfig):
         super().__init__(config)
         self.base_url = config.base_url or "https://api.github.com"
+    
+    def set_token(self, token: str) -> None:
+        """Set the API token for this connector."""
+        self.config.api_key = token
     
     def _get_headers(self) -> Dict[str, str]:
         """Get headers for GitHub API requests."""
@@ -201,151 +420,60 @@ class GitHubConnector(BaseConnector):
         return headers
     
     def get_tools(self) -> List[ToolDefinition]:
-        """Return GitHub tools."""
-        return [
-            ToolDefinition(
-                name="github_search_repositories",
-                description="Search GitHub repositories",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "description": "Search query"},
-                        "sort": {"type": "string", "enum": ["stars", "forks", "updated"], "default": "best-match"},
-                        "order": {"type": "string", "enum": ["asc", "desc"], "default": "desc"},
-                        "limit": {"type": "integer", "default": 10, "maximum": 100},
-                    },
-                    "required": ["query"],
-                },
-                handler=self._search_repositories,
-            ),
-            ToolDefinition(
-                name="github_get_repository",
-                description="Get details of a GitHub repository",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "owner": {"type": "string", "description": "Repository owner"},
-                        "repo": {"type": "string", "description": "Repository name"},
-                    },
-                    "required": ["owner", "repo"],
-                },
-                handler=self._get_repository,
-            ),
-            ToolDefinition(
-                name="github_list_issues",
-                description="List issues in a repository",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "owner": {"type": "string"},
-                        "repo": {"type": "string"},
-                        "state": {"type": "string", "enum": ["open", "closed", "all"], "default": "open"},
-                        "labels": {"type": "string", "description": "Comma-separated label names"},
-                        "limit": {"type": "integer", "default": 30},
-                    },
-                    "required": ["owner", "repo"],
-                },
-                handler=self._list_issues,
-            ),
-            ToolDefinition(
-                name="github_create_issue",
-                description="Create a new issue in a repository",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "owner": {"type": "string"},
-                        "repo": {"type": "string"},
-                        "title": {"type": "string"},
-                        "body": {"type": "string"},
-                        "labels": {"type": "array", "items": {"type": "string"}},
-                        "assignees": {"type": "array", "items": {"type": "string"}},
-                    },
-                    "required": ["owner", "repo", "title"],
-                },
-                handler=self._create_issue,
-            ),
-            ToolDefinition(
-                name="github_list_pull_requests",
-                description="List pull requests in a repository",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "owner": {"type": "string"},
-                        "repo": {"type": "string"},
-                        "state": {"type": "string", "enum": ["open", "closed", "all"], "default": "open"},
-                        "limit": {"type": "integer", "default": 30},
-                    },
-                    "required": ["owner", "repo"],
-                },
-                handler=self._list_pull_requests,
-            ),
-            ToolDefinition(
-                name="github_create_pull_request",
-                description="Create a new pull request",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "owner": {"type": "string"},
-                        "repo": {"type": "string"},
-                        "title": {"type": "string"},
-                        "body": {"type": "string"},
-                        "head": {"type": "string", "description": "Branch name for PR source"},
-                        "base": {"type": "string", "description": "Branch name for PR target", "default": "main"},
-                        "draft": {"type": "boolean", "default": False},
-                    },
-                    "required": ["owner", "repo", "title", "head"],
-                },
-                handler=self._create_pull_request,
-            ),
-            ToolDefinition(
-                name="github_get_file_contents",
-                description="Get contents of a file in a repository",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "owner": {"type": "string"},
-                        "repo": {"type": "string"},
-                        "path": {"type": "string", "description": "File path in repository"},
-                        "ref": {"type": "string", "description": "Branch/commit ref"},
-                    },
-                    "required": ["owner", "repo", "path"],
-                },
-                handler=self._get_file_contents,
-            ),
-            ToolDefinition(
-                name="github_create_or_update_file",
-                description="Create or update a file in a repository",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "owner": {"type": "string"},
-                        "repo": {"type": "string"},
-                        "path": {"type": "string"},
-                        "message": {"type": "string", "description": "Commit message"},
-                        "content": {"type": "string", "description": "File content"},
-                        "branch": {"type": "string"},
-                        "sha": {"type": "string", "description": "Required for updates - the blob SHA"},
-                    },
-                    "required": ["owner", "repo", "path", "message", "content", "branch"],
-                },
-                handler=self._create_or_update_file,
-            ),
-            ToolDefinition(
-                name="github_search_code",
-                description="Search code in GitHub repositories",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "description": "Search query (supports GitHub code search syntax)"},
-                        "limit": {"type": "integer", "default": 30},
-                    },
-                    "required": ["query"],
-                },
-                handler=self._search_code,
-            ),
-        ]
+        """Return GitHub tools dynamically from TOOL_MAPPING."""
+        tools = []
+        for tool_key, tool_def in self.TOOL_MAPPING.items():
+            handler = getattr(self, tool_def["handler"], None)
+            if handler:
+                tools.append(ToolDefinition(
+                    name=tool_def["name"],
+                    description=tool_def["description"],
+                    parameters=tool_def["parameters"],
+                    handler=handler,
+                ))
+        return tools
     
-    # call_tool is inherited from BaseConnector
+    async def get_tools_async(self) -> List[ToolDefinition]:
+        """Return GitHub tools (sync version for compatibility)."""
+        return self.get_tools()
+    
+    def get_resources(self) -> List[ResourceDefinition]:
+        """Return GitHub resources from RESOURCE_MAPPING."""
+        resources = []
+        for res_key, res_def in self.RESOURCE_MAPPING.items():
+            handler = getattr(self, res_def["handler"], None)
+            if handler:
+                resources.append(ResourceDefinition(
+                    uri=res_def["uri"],
+                    name=res_def["name"],
+                    description=res_def["description"],
+                    read_handler=handler,
+                ))
+        return resources
+    
+    def get_prompts(self) -> List[PromptDefinition]:
+        """Return GitHub prompts from PROMPT_MAPPING."""
+        prompts = []
+        for prompt_key, prompt_def in self.PROMPT_MAPPING.items():
+            prompts.append(PromptDefinition(
+                name=prompt_def["name"],
+                description=prompt_def["description"],
+                arguments=prompt_def.get("arguments", []),
+                template=prompt_def.get("template", ""),
+            ))
+        return prompts
+    
+    async def read_resource(self, uri: str) -> Optional[Dict[str, Any]]:
+        """Read a GitHub resource by URI."""
+        resources = self.get_resources()
+        for resource in resources:
+            if resource.uri == uri and resource.read_handler:
+                try:
+                    result = await resource.read_handler()
+                    return result
+                except Exception as e:
+                    return {"error": str(e)}
+        return None
     
     async def health_check(self) -> Tuple[bool, str]:
         """Check GitHub API accessibility."""
@@ -359,7 +487,13 @@ class GitHubConnector(BaseConnector):
                 data = response.json()
                 remaining = data.get("resources", {}).get("core", {}).get("remaining", 0)
                 return True, f"GitHub API accessible, {remaining} requests remaining"
+            elif response.status_code == 401:
+                return False, "GitHub API requires authentication. Connect your account."
+            elif response.status_code == 403:
+                return False, "GitHub API access forbidden. Check token permissions."
             return False, f"GitHub API returned status {response.status_code}"
+        except httpx.ConnectError:
+            return False, "Cannot connect to GitHub API"
         except Exception as e:
             return False, f"GitHub API check failed: {e}"
     
@@ -649,4 +783,65 @@ class GitHubConnector(BaseConnector):
                 }
                 for item in data.get("items", [])
             ],
+        }
+    
+    # --- Resource Handlers ---
+    
+    async def _list_repos_resource(self) -> Dict[str, Any]:
+        """List repositories accessible to the user (for resource)."""
+        client = await self.get_client()
+        response = await self._retry_request(
+            lambda: client.get(
+                f"{self.base_url}/user/repos",
+                params={"sort": "updated", "per_page": 30},
+                headers=self._get_headers(),
+            )
+        )
+        response.raise_for_status()
+        data = response.json()
+        
+        return {
+            "repos": [
+                {
+                    "name": r.get("full_name"),
+                    "description": r.get("description"),
+                    "private": r.get("private"),
+                    "url": r.get("html_url"),
+                }
+                for r in data
+            ],
+        }
+    
+    async def _get_user_resource(self) -> Dict[str, Any]:
+        """Get current user profile (for resource)."""
+        client = await self.get_client()
+        response = await client.get(
+            f"{self.base_url}/user",
+            headers=self._get_headers(),
+        )
+        response.raise_for_status()
+        data = response.json()
+        
+        return {
+            "login": data.get("login"),
+            "name": data.get("name"),
+            "email": data.get("email"),
+            "avatar_url": data.get("avatar_url"),
+        }
+    
+    async def _get_rate_limit_resource(self) -> Dict[str, Any]:
+        """Get rate limit status (for resource)."""
+        client = await self.get_client()
+        response = await client.get(
+            f"{self.base_url}/rate_limit",
+            headers=self._get_headers(),
+        )
+        response.raise_for_status()
+        data = response.json()
+        
+        core = data.get("resources", {}).get("core", {})
+        return {
+            "limit": core.get("limit"),
+            "remaining": core.get("remaining"),
+            "reset": core.get("reset"),
         }

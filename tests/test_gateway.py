@@ -567,7 +567,7 @@ class TestFastAPIEndpoints:
             SecurityContext,
         )
 
-        config = GatewayConfig()
+        config = RelayConfig()
         oauth = create_oauth_provider("test-secret-key-endpoints")
         connector_oauth = create_connector_oauth(config)
         audit = AuditLogger(log_path="/tmp/test_audit_endpoints.log", enabled=False)
@@ -947,6 +947,276 @@ class TestOAuthFlow:
         user_info = oauth.validate_access_token(tokens.access_token)
         assert user_info is not None
         assert user_info["scope"] == "mcp:tools"
+
+
+# ===========================================================================
+# User Authentication Tests (new — multi-user system)
+# ===========================================================================
+
+class TestUserAuth:
+    """Test user registration, login, and session management."""
+
+    @pytest.fixture(autouse=True)
+    def setup_db(self, tmp_path):
+        """Use an isolated test database for each test."""
+        import auth.database as db
+        test_db = str(tmp_path / "test_users.db")
+        original_path = db.DB_PATH
+        db.DB_PATH = test_db
+        db.init_db()
+        yield
+        db.DB_PATH = original_path
+
+    def _register_user(self, client, username="testuser", password="SecurePass123", email=None):
+        """Helper to register a user."""
+        body = {"username": username, "password": password}
+        if email:
+            body["email"] = email
+        return client.post("/auth/register", json=body)
+
+    def _login_user(self, client, username="testuser", password="SecurePass123"):
+        """Helper to login a user and return response with session cookie."""
+        return client.post("/auth/login", json={"username": username, "password": password})
+
+    def test_register_success(self):
+        from fastapi.testclient import TestClient
+        import gateway.server as server_module
+        client = TestClient(server_module.app, raise_server_exceptions=False)
+
+        resp = self._register_user(client, "newuser", "TestPass123")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["username"] == "newuser"
+        assert data["user_id"].startswith("usr_")
+
+    def test_register_duplicate_username(self):
+        from fastapi.testclient import TestClient
+        import gateway.server as server_module
+        client = TestClient(server_module.app, raise_server_exceptions=False)
+
+        self._register_user(client, "dupuser", "TestPass123")
+        resp = self._register_user(client, "dupuser", "OtherPass456")
+        assert resp.status_code == 409
+
+    def test_register_short_password(self):
+        from fastapi.testclient import TestClient
+        import gateway.server as server_module
+        client = TestClient(server_module.app, raise_server_exceptions=False)
+
+        resp = self._register_user(client, "shortpw", "abc")
+        assert resp.status_code == 400
+
+    def test_register_short_username(self):
+        from fastapi.testclient import TestClient
+        import gateway.server as server_module
+        client = TestClient(server_module.app, raise_server_exceptions=False)
+
+        resp = self._register_user(client, "ab", "TestPass123")
+        assert resp.status_code == 400
+
+    def test_login_success(self):
+        from fastapi.testclient import TestClient
+        import gateway.server as server_module
+        from auth.oauth import create_oauth_provider
+        from auth.oauth_providers import create_oauth_provider as create_connector_oauth
+        from backends.manager import BackendManager
+        from config.settings import RelayConfig
+        from connectors import ConnectorRegistry
+        from security.middleware import AuditLogger, InputValidator, IPRestrictions, RateLimiter, SecurityContext
+
+        config = RelayConfig()
+        oauth = create_oauth_provider("test-secret-key-endpoints")
+        connector_oauth = create_connector_oauth(config)
+        audit = AuditLogger(log_path="/tmp/test_audit_login.log", enabled=False)
+        security = SecurityContext(
+            rate_limiter=RateLimiter(60, 1000),
+            validator=InputValidator(),
+            audit_logger=audit,
+            ip_restrictions=IPRestrictions(),
+        )
+        backends = BackendManager()
+        connectors = ConnectorRegistry()
+        server_module.state = server_module.AppState(
+            config=config, oauth=oauth, connector_oauth=connector_oauth,
+            security=security, backends=backends, connectors=connectors,
+        )
+
+        client = TestClient(server_module.app, raise_server_exceptions=False)
+        self._register_user(client, "loginuser", "TestPass123")
+        resp = self._login_user(client, "loginuser", "TestPass123")
+        assert resp.status_code == 200
+        assert "session" in resp.cookies
+
+        server_module.state = None
+
+    def test_login_wrong_password(self):
+        from fastapi.testclient import TestClient
+        import gateway.server as server_module
+        from auth.oauth import create_oauth_provider
+        from auth.oauth_providers import create_oauth_provider as create_connector_oauth
+        from backends.manager import BackendManager
+        from config.settings import RelayConfig
+        from connectors import ConnectorRegistry
+        from security.middleware import AuditLogger, InputValidator, IPRestrictions, RateLimiter, SecurityContext
+
+        config = RelayConfig()
+        oauth = create_oauth_provider("test-secret-key-endpoints")
+        connector_oauth = create_connector_oauth(config)
+        audit = AuditLogger(log_path="/tmp/test_audit_wrongpw.log", enabled=False)
+        security = SecurityContext(
+            rate_limiter=RateLimiter(60, 1000),
+            validator=InputValidator(),
+            audit_logger=audit,
+            ip_restrictions=IPRestrictions(),
+        )
+        backends = BackendManager()
+        connectors = ConnectorRegistry()
+        server_module.state = server_module.AppState(
+            config=config, oauth=oauth, connector_oauth=connector_oauth,
+            security=security, backends=backends, connectors=connectors,
+        )
+
+        client = TestClient(server_module.app, raise_server_exceptions=False)
+        self._register_user(client, "wrongpw", "TestPass123")
+        resp = self._login_user(client, "wrongpw", "WrongPass456")
+        assert resp.status_code == 401
+
+        server_module.state = None
+
+    def test_login_nonexistent_user(self):
+        from fastapi.testclient import TestClient
+        import gateway.server as server_module
+        from auth.oauth import create_oauth_provider
+        from auth.oauth_providers import create_oauth_provider as create_connector_oauth
+        from backends.manager import BackendManager
+        from config.settings import RelayConfig
+        from connectors import ConnectorRegistry
+        from security.middleware import AuditLogger, InputValidator, IPRestrictions, RateLimiter, SecurityContext
+
+        config = RelayConfig()
+        oauth = create_oauth_provider("test-secret-key-endpoints")
+        connector_oauth = create_connector_oauth(config)
+        audit = AuditLogger(log_path="/tmp/test_audit_nobody.log", enabled=False)
+        security = SecurityContext(
+            rate_limiter=RateLimiter(60, 1000),
+            validator=InputValidator(),
+            audit_logger=audit,
+            ip_restrictions=IPRestrictions(),
+        )
+        backends = BackendManager()
+        connectors = ConnectorRegistry()
+        server_module.state = server_module.AppState(
+            config=config, oauth=oauth, connector_oauth=connector_oauth,
+            security=security, backends=backends, connectors=connectors,
+        )
+
+        client = TestClient(server_module.app, raise_server_exceptions=False)
+        resp = self._login_user(client, "nobody", "TestPass123")
+        assert resp.status_code == 401
+
+        server_module.state = None
+
+    def test_get_me_with_session(self):
+        from fastapi.testclient import TestClient
+        import gateway.server as server_module
+        from auth.oauth import create_oauth_provider
+        from auth.oauth_providers import create_oauth_provider as create_connector_oauth
+        from backends.manager import BackendManager
+        from config.settings import RelayConfig
+        from connectors import ConnectorRegistry
+        from security.middleware import AuditLogger, InputValidator, IPRestrictions, RateLimiter, SecurityContext
+
+        config = RelayConfig()
+        oauth = create_oauth_provider("test-secret-key-endpoints")
+        connector_oauth = create_connector_oauth(config)
+        audit = AuditLogger(log_path="/tmp/test_audit_me.log", enabled=False)
+        security = SecurityContext(
+            rate_limiter=RateLimiter(60, 1000),
+            validator=InputValidator(),
+            audit_logger=audit,
+            ip_restrictions=IPRestrictions(),
+        )
+        backends = BackendManager()
+        connectors = ConnectorRegistry()
+        server_module.state = server_module.AppState(
+            config=config, oauth=oauth, connector_oauth=connector_oauth,
+            security=security, backends=backends, connectors=connectors,
+        )
+
+        client = TestClient(server_module.app, raise_server_exceptions=False)
+        self._register_user(client, "meme", "TestPass123", "meme@test.com")
+        self._login_user(client, "meme", "TestPass123")
+        resp = client.get("/auth/me")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["username"] == "meme"
+        assert data["email"] == "meme@test.com"
+
+        server_module.state = None
+
+    def test_get_me_without_session(self):
+        from fastapi.testclient import TestClient
+        import gateway.server as server_module
+        client = TestClient(server_module.app, raise_server_exceptions=False)
+
+        resp = client.get("/auth/me")
+        assert resp.status_code == 401
+
+    def test_dashboard_redirects_without_session(self):
+        from fastapi.testclient import TestClient
+        import gateway.server as server_module
+        client = TestClient(server_module.app, raise_server_exceptions=False)
+
+        resp = client.get("/app", follow_redirects=False)
+        assert resp.status_code == 307
+        assert "/auth/login" in resp.headers.get("location", "")
+
+    def test_dashboard_with_session(self):
+        from fastapi.testclient import TestClient
+        import gateway.server as server_module
+        from auth.oauth import create_oauth_provider
+        from auth.oauth_providers import create_oauth_provider as create_connector_oauth
+        from backends.manager import BackendManager
+        from config.settings import RelayConfig
+        from connectors import ConnectorRegistry
+        from security.middleware import AuditLogger, InputValidator, IPRestrictions, RateLimiter, SecurityContext
+
+        config = RelayConfig()
+        oauth = create_oauth_provider("test-secret-key-endpoints")
+        connector_oauth = create_connector_oauth(config)
+        audit = AuditLogger(log_path="/tmp/test_audit_dashboard.log", enabled=False)
+        security = SecurityContext(
+            rate_limiter=RateLimiter(60, 1000),
+            validator=InputValidator(),
+            audit_logger=audit,
+            ip_restrictions=IPRestrictions(),
+        )
+        backends = BackendManager()
+        connectors = ConnectorRegistry()
+        server_module.state = server_module.AppState(
+            config=config, oauth=oauth, connector_oauth=connector_oauth,
+            security=security, backends=backends, connectors=connectors,
+        )
+
+        client = TestClient(server_module.app, raise_server_exceptions=False)
+        self._register_user(client, "dashuser", "TestPass123")
+        self._login_user(client, "dashuser", "TestPass123")
+        resp = client.get("/app")
+        assert resp.status_code == 200
+        assert "Dashboard" in resp.text
+
+        server_module.state = None
+
+    def test_logout_clears_session(self):
+        from fastapi.testclient import TestClient
+        import gateway.server as server_module
+        client = TestClient(server_module.app, raise_server_exceptions=False)
+
+        self._register_user(client, "logoutuser", "TestPass123")
+        self._login_user(client, "logoutuser", "TestPass123")
+        resp = client.post("/auth/logout")
+        assert resp.status_code == 200
+        assert resp.json()["logged_out"] is True
 
 
 if __name__ == "__main__":

@@ -1,0 +1,140 @@
+{% extends "base.html" %}
+{% set show_sidebar = true %}
+{% set active_page = "settings" %}
+{% block page_title %}Settings{% endblock %}
+{% block content %}
+<div class="settings-page" x-data="settingsManager()">
+    <div class="settings-section">
+        <h2>Profile</h2>
+        <form @submit.prevent="updateProfile" class="settings-form">
+            <div class="form-group">
+                <label for="username">Username</label>
+                <input type="text" id="username" x-model="username" required minlength="3" pattern="[a-zA-Z0-9_]+">
+            </div>
+            <div class="form-group">
+                <label for="email">Email</label>
+                <input type="email" id="email" x-model="email" placeholder="you@example.com">
+            </div>
+            <div class="form-error" x-show="profileError" x-text="profileError"></div>
+            <div class="form-success" x-show="profileSuccess" x-text="profileSuccess"></div>
+            <button type="submit" class="btn btn-primary" :disabled="profileSaving">
+                <span x-show="!profileSaving">Save Changes</span>
+                <span x-show="profileSaving">Saving...</span>
+            </button>
+        </form>
+    </div>
+
+    <div class="settings-section">
+        <h2>Change Password</h2>
+        <form @submit.prevent="changePassword" class="settings-form">
+            <div class="form-group">
+                <label for="current_password">Current Password</label>
+                <input type="password" id="current_password" x-model="currentPassword" required>
+            </div>
+            <div class="form-group">
+                <label for="new_password">New Password</label>
+                <input type="password" id="new_password" x-model="newPassword" required minlength="8">
+            </div>
+            <div class="form-group">
+                <label for="confirm_password">Confirm New Password</label>
+                <input type="password" id="confirm_password" x-model="confirmPassword" required minlength="8">
+            </div>
+            <div class="form-error" x-show="passwordError" x-text="passwordError"></div>
+            <div class="form-success" x-show="passwordSuccess" x-text="passwordSuccess"></div>
+            <button type="submit" class="btn btn-primary" :disabled="passwordSaving">
+                <span x-show="!passwordSaving">Update Password</span>
+                <span x-show="passwordSaving">Updating...</span>
+            </button>
+        </form>
+    </div>
+
+    <div class="settings-section settings-section-danger">
+        <h2>Danger Zone</h2>
+        <div class="danger-actions">
+            <div>
+                <h3>Revoke All Sessions</h3>
+                <p>This will log you out of all devices and invalidate all active tokens.</p>
+            </div>
+            <form action="/auth/logout" method="post">
+                <button type="submit" class="btn btn-danger">Revoke All Sessions</button>
+            </form>
+        </div>
+    </div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+function settingsManager() {
+    return {
+        username: '{{ user.username }}',
+        email: '{{ user.email or "" }}',
+        currentPassword: '',
+        newPassword: '',
+        confirmPassword: '',
+        profileError: null,
+        profileSuccess: null,
+        passwordError: null,
+        passwordSuccess: null,
+        profileSaving: false,
+        passwordSaving: false,
+        async updateProfile() {
+            this.profileError = null;
+            this.profileSuccess = null;
+            this.profileSaving = true;
+            try {
+                const resp = await fetch('/auth/me', {
+                    method: 'PUT',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        username: this.username,
+                        email: this.email || null,
+                    }),
+                });
+                const data = await resp.json();
+                if (!resp.ok) {
+                    this.profileError = data.detail || data.error || 'Update failed';
+                    return;
+                }
+                this.profileSuccess = 'Profile updated successfully';
+            } catch (e) {
+                this.profileError = 'Network error';
+            } finally {
+                this.profileSaving = false;
+            }
+        },
+        async changePassword() {
+            this.passwordError = null;
+            this.passwordSuccess = null;
+            if (this.newPassword !== this.confirmPassword) {
+                this.passwordError = 'Passwords do not match';
+                return;
+            }
+            this.passwordSaving = true;
+            try {
+                const resp = await fetch('/auth/me', {
+                    method: 'PUT',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        current_password: this.currentPassword,
+                        new_password: this.newPassword,
+                    }),
+                });
+                const data = await resp.json();
+                if (!resp.ok) {
+                    this.passwordError = data.detail || data.error || 'Password update failed';
+                    return;
+                }
+                this.passwordSuccess = 'Password updated successfully';
+                this.currentPassword = '';
+                this.newPassword = '';
+                this.confirmPassword = '';
+            } catch (e) {
+                this.passwordError = 'Network error';
+            } finally {
+                this.passwordSaving = false;
+            }
+        }
+    };
+}
+</script>
+{% endblock %}

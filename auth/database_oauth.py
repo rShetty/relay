@@ -22,7 +22,7 @@ class DatabaseOAuthProvider(OAuthProvider):
     This replaces the in-memory dictionaries with database operations.
     """
     
-    def __init__(self, jwt_manager, code_expire_minutes=10, enable_demo_user=True,
+    def __init__(self, jwt_manager, code_expire_minutes=10, enable_demo_user=False,
                  demo_user_id="demo_user_001", demo_username="demo"):
         # Initialize database
         db.init_db()
@@ -125,9 +125,8 @@ class DatabaseOAuthProvider(OAuthProvider):
         user_id: Optional[str] = None,
     ) -> str:
         """Create an authorization code for the authorization endpoint."""
-        # Use demo user if no user_id provided (for POC)
         if user_id is None:
-            user_id = "demo_user_001"  # Default for POC
+            raise ValueError("user_id is required — demo user is disabled")
         
         code = secrets.token_urlsafe(32)
         expires_at = datetime.now(timezone.utc) + timedelta(minutes=self.code_expire_minutes)

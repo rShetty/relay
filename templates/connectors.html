@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% set show_sidebar = true %}
+{% set active_page = "connectors" %}
+{% block page_title %}Connectors{% endblock %}
+{% block content %}
+<div class="connectors-grid">
+    {% for connector in connectors %}
+    <div class="connector-card">
+        <div class="connector-card-header">
+            <div class="connector-card-icon {{ 'connected' if connector.connected else '' }}">
+                {{ connector.name[:1].upper() }}
+            </div>
+            <span class="status-badge {{ 'status-connected' if connector.connected else 'status-disconnected' }}">
+                {{ 'Connected' if connector.connected else 'Not Connected' }}
+            </span>
+        </div>
+        <a href="/connectors/{{ connector.name }}" class="connector-card-body-link">
+            <div class="connector-card-body">
+                <h3>{{ connector.display_name }}</h3>
+                <p>{{ connector.description }}</p>
+                <div class="connector-card-meta">
+                    <span>{{ connector.tools_count }} tools</span>
+                    {% if connector.connected %}
+                    <span class="meta-dot">Connected as {{ connector.connected_as or 'user' }}</span>
+                    {% endif %}
+                </div>
+            </div>
+        </a>
+        <div class="connector-card-actions">
+            {% if connector.connected %}
+            <a href="/connectors/{{ connector.name }}" class="btn btn-outline btn-sm">Details</a>
+            <form action="/connectors/{{ connector.name }}/disconnect" method="post" class="inline-form">
+                <button type="submit" class="btn btn-outline btn-sm btn-danger">Disconnect</button>
+            </form>
+            {% else %}
+            <a href="/oauth/authorize/{{ connector.name }}" class="btn btn-primary btn-sm">Connect</a>
+            {% endif %}
+        </div>
+    </div>
+    {% endfor %}
+</div>
+{% endblock %}

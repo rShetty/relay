@@ -1,0 +1,221 @@
+{% extends "base.html" %}
+{% set show_sidebar = true %}
+{% set active_page = "connectors" %}
+{% block page_title %}{{ connector.display_name }}{% endblock %}
+{% block content %}
+<div class="connector-detail">
+    <div class="detail-header">
+        <div class="detail-header-info">
+            <div class="connector-icon-large {{ 'connected' if connector.connected else '' }}">
+                {{ connector.name[:1].upper() }}
+            </div>
+            <div>
+                <h1>{{ connector.display_name }}</h1>
+                <p class="connector-desc">{{ connector.description }}</p>
+                <div class="status-row">
+                    <span class="status-badge {{ 'status-connected' if connector.connected else 'status-disconnected' }}">
+                        {{ 'Connected' if connector.connected else 'Not Connected' }}
+                    </span>
+                    <span class="status-badge {{ 'status-healthy' if connector.healthy else 'status-unhealthy' }}">
+                        {{ 'Healthy' if connector.healthy else 'Unhealthy' }}
+                    </span>
+                    <span class="meta">Calls: {{ connector.total_calls }} | Errors: {{ connector.total_errors }}</span>
+                </div>
+            </div>
+        </div>
+        <div class="detail-actions">
+            {% if connector.connected %}
+            <form action="/connectors/{{ connector.name }}/disconnect" method="post">
+                <button type="submit" class="btn btn-danger">Disconnect</button>
+            </form>
+            {% else %}
+            <a href="/oauth/authorize/{{ connector.name }}" class="btn btn-primary">Connect</a>
+            {% endif %}
+        </div>
+    </div>
+
+    {% if connector.tools %}
+    <div class="detail-section">
+        <h2>Tools <span class="count">({{ connector.tools|length }})</span></h2>
+        <div class="tools-grid">
+            {% for tool in connector.tools %}
+            <div class="tool-card">
+                <h3>{{ tool.name }}</h3>
+                <p>{{ tool.description }}</p>
+                {% if tool.parameters and tool.parameters.properties %}
+                <div class="tool-params">
+                    <strong>Parameters:</strong>
+                    <ul>
+                        {% for param_name, param_info in tool.parameters.properties.items() %}
+                        <li><code>{{ param_name }}</code>: {{ param_info.description or 'No description' }}</li>
+                        {% endfor %}
+                    </ul>
+                </div>
+                {% endif %}
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+    {% endif %}
+
+    {% if connector.resources %}
+    <div class="detail-section">
+        <h2>Resources <span class="count">({{ connector.resources|length }})</span></h2>
+        <div class="resources-list">
+            {% for resource in connector.resources %}
+            <div class="resource-item">
+                <div class="resource-icon">📄</div>
+                <div class="resource-info">
+                    <h3>{{ resource.name }}</h3>
+                    <code class="resource-uri">{{ resource.uri }}</code>
+                    <p>{{ resource.description }}</p>
+                    {% if resource.mime_type %}
+                    <span class="mime-type">{{ resource.mime_type }}</span>
+                    {% endif %}
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+    {% endif %}
+
+    {% if connector.prompts %}
+    <div class="detail-section">
+        <h2>Prompts <span class="count">({{ connector.prompts|length }})</span></h2>
+        <div class="prompts-list">
+            {% for prompt in connector.prompts %}
+            <div class="prompt-card">
+                <h3>{{ prompt.name }}</h3>
+                <p>{{ prompt.description }}</p>
+                {% if prompt.arguments %}
+                <div class="prompt-args">
+                    <strong>Arguments:</strong>
+                    <ul>
+                        {% if prompt.arguments is mapping %}
+                        {% for arg_name, arg_info in prompt.arguments.items() %}
+                        <li><code>{{ arg_name }}</code>: {{ arg_info.description or 'No description' }}</li>
+                        {% endfor %}
+                        {% else %}
+                        {% for arg in prompt.arguments %}
+                        <li><code>{{ arg.name }}</code>: {{ arg.description or 'No description' }}</li>
+                        {% endfor %}
+                        {% endif %}
+                    </ul>
+                </div>
+                {% endif %}
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+    {% endif %}
+
+    {% if not connector.tools and not connector.resources and not connector.prompts %}
+    <div class="empty-state">
+        <p>No tools, resources, or prompts available for this connector.</p>
+    </div>
+    {% endif %}
+    
+    <div class="detail-section">
+        <h2>Connect to MCP Clients</h2>
+        <p class="section-desc">Use this connector with your favorite MCP-compatible clients. Copy the configuration for your client.</p>
+        
+        {% if not api_key %}
+        <div class="warning-box">
+            <p>You need an API key to use MCP clients. Generate one from the <a href="/api-keys">API Keys page</a>.</p>
+        </div>
+        {% endif %}
+        
+        <div class="client-configs">
+            <div class="client-card">
+                <div class="client-header">
+                    <span class="client-icon">🤖</span>
+                    <h3>Claude Code</h3>
+                </div>
+                <div class="client-instructions">
+                    <p>Add to your Claude Code config:</p>
+                    <div class="code-block">
+<pre><code>{
+  "mcpServers": {
+    "relay-{{ connector.name }}": {
+      "url": "http://localhost:8000/user-mcp/{{ api_key }}/{{ connector.name }}/mcp"
+    }
+  }
+}</code></pre>
+                    </div>
+                    <button class="btn btn-sm copy-btn" data-copy='{"mcpServers": {"relay-{{ connector.name }}": {"url": "http://localhost:8000/user-mcp/{{ api_key }}/{{ connector.name }}/mcp"}}}'>Copy Config</button>
+                </div>
+            </div>
+            
+            <div class="client-card">
+                <div class="client-header">
+                    <span class="client-icon">👁️</span>
+                    <h3>Cursor</h3>
+                </div>
+                <div class="client-instructions">
+                    <p>Add to Cursor Settings > MCP Servers:</p>
+                    <div class="code-block">
+<pre><code>{
+  "mcpServers": {
+    "relay-{{ connector.name }}": {
+      "url": "http://localhost:8000/user-mcp/{{ api_key }}/{{ connector.name }}/mcp"
+    }
+  }
+}</code></pre>
+                    </div>
+                    <button class="btn btn-sm copy-btn" data-copy='{"mcpServers": {"relay-{{ connector.name }}": {"url": "http://localhost:8000/user-mcp/{{ api_key }}/{{ connector.name }}/mcp"}}}'>Copy Config</button>
+                </div>
+            </div>
+            
+            <div class="client-card">
+                <div class="client-header">
+                    <span class="client-icon">✨</span>
+                    <h3>Gemini CLI</h3>
+                </div>
+                <div class="client-instructions">
+                    <p>Add to your gemini-cli config:</p>
+                    <div class="code-block">
+<pre><code>mcpServers:
+  relay-{{ connector.name }}:
+    url: http://localhost:8000/mcp/user/{{ api_key }}/{{ connector.name }}/mcp</code></pre>
+                    </div>
+                    <button class="btn btn-sm copy-btn" data-copy="mcpServers:\n  relay-{{ connector.name }}:\n    url: http://localhost:8000/mcp/user/{{ api_key }}/{{ connector.name }}/mcp">Copy Config</button>
+                </div>
+            </div>
+            
+            <div class="client-card">
+                <div class="client-header">
+                    <span class="client-icon">📝</span>
+                    <h3>OpenCode</h3>
+                </div>
+                <div class="client-instructions">
+                    <p>Add to OpenCode settings:</p>
+                    <div class="code-block">
+<pre><code>{
+  "mcp": {
+    "servers": {
+      "relay-{{ connector.name }}": {
+        "url": "http://localhost:8000/user-mcp/{{ api_key }}/{{ connector.name }}/mcp"
+      }
+    }
+  }
+}</code></pre>
+                    </div>
+                    <button class="btn btn-sm copy-btn" data-copy='{"mcp": {"servers": {"relay-{{ connector.name }}": {"url": "http://localhost:8000/user-mcp/{{ api_key }}/{{ connector.name }}/mcp"}}}'>Copy Config</button>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+document.querySelectorAll('.copy-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+        const text = btn.dataset.copy;
+        navigator.clipboard.writeText(text).then(() => {
+            btn.textContent = 'Copied!';
+            setTimeout(() => btn.textContent = 'Copy Config', 2000);
+        });
+    });
+});
+</script>
+{% endblock %}

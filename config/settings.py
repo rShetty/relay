@@ -261,6 +261,15 @@ def clear_config_cache() -> None:
 # Backend definitions - these are the third-party services we proxy to
 # The 'connector' field maps to the OAuth connector for per-user token auth
 BACKEND_DEFINITIONS: Dict[str, Dict[str, Any]] = {
+    "relay-github": {
+        "type": "mcp",
+        "name": "Relay GitHub",
+        "description": "Relay GitHub MCP server",
+        "url": "http://localhost:8000/mcp/github/mcp",
+        "connector": "github",
+        "tools": [],
+        "requires_auth": True,
+    },
     # Example MCP servers
     "github": {
         "type": "mcp",

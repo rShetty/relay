@@ -17,7 +17,7 @@ def create_database_oauth_provider(
     secret_key: str,
     access_token_expire_minutes: int = 30,
     refresh_token_expire_days: int = 7,
-    enable_demo_user: bool = True,
+    enable_demo_user: bool = False,
 ) -> DatabaseOAuthProvider:
     """Create a database-backed OAuth provider."""
     jwt_manager = JWTManager(

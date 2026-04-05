@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple, Type
 
 from .github import BaseConnector, ConnectorConfig, ToolDefinition
+from .github import ResourceDefinition, PromptDefinition
 from .github import GitHubConnector
 from .slack import SlackConnector
 from .linear import LinearConnector
@@ -85,6 +86,52 @@ class ConnectorRegistry:
     # -------------------------------------------------------------------------
     # Connector Registration
     # -------------------------------------------------------------------------
+    
+    async def register_connector_async(
+        self,
+        name: str,
+        connector: BaseConnector,
+        enabled: bool = True,
+    ) -> None:
+        """
+        Register a connector instance with async tool discovery.
+        
+        Args:
+            name: Unique name for this connector
+            connector: Connector instance
+            enabled: Whether the connector is active
+        """
+        if name in self._connectors:
+            logger.warning(f"Connector '{name}' already registered, replacing")
+        
+        self._connectors[name] = ConnectorState(
+            connector=connector,
+            enabled=enabled,
+        )
+        
+        # Index tools - try async first, fallback to sync
+        tools = []
+        has_async = hasattr(connector, "get_tools_async")
+        logger.info(f"  Connector '{name}': has get_tools_async={has_async}")
+        if has_async:
+            try:
+                tools = await connector.get_tools_async()
+                logger.info(f"  Connector '{name}': discovered {len(tools)} tools via async")
+            except Exception as e:
+                logger.warning(f"  Connector '{name}': async tool discovery failed: {e}, using sync")
+                tools = connector.get_tools()
+        else:
+            tools = connector.get_tools()
+        
+        for tool in tools:
+            if tool.name in self._tool_index:
+                logger.warning(
+                    f"Tool '{tool.name}' already registered by '{self._tool_index[tool.name]}', "
+                    f"now also available from '{name}'"
+                )
+            self._tool_index[tool.name] = name
+        
+        logger.info(f"Registered connector '{name}' with {len(tools)} tools")
     
     def register_connector(
         self,
@@ -199,6 +246,32 @@ class ConnectorRegistry:
             })
         return result
     
+    async def list_connectors_async(self) -> List[Dict[str, Any]]:
+        """List all registered connectors with their status (async tool discovery)."""
+        result = []
+        for name, state in self._connectors.items():
+            # Try async tool discovery first, fall back to sync
+            try:
+                if hasattr(state.connector, "get_tools_async"):
+                    tools = await state.connector.get_tools_async()
+                else:
+                    tools = state.connector.get_tools()
+            except Exception:
+                tools = state.connector.get_tools()
+            
+            result.append({
+                "name": name,
+                "display_name": state.connector.display_name,
+                "description": state.connector.description,
+                "enabled": state.enabled,
+                "healthy": state.healthy,
+                "tools": [t.name for t in tools],
+                "total_calls": state.total_calls,
+                "total_errors": state.total_errors,
+                "last_health_check": state.last_health_check.isoformat() if state.last_health_check else None,
+            })
+        return result
+    
     # -------------------------------------------------------------------------
     # Tool Discovery
     # -------------------------------------------------------------------------
@@ -226,6 +299,63 @@ class ConnectorRegistry:
                 })
         
         return tools
+    
+    def get_all_resources(self) -> List[Dict[str, Any]]:
+        """Get all resources from all registered connectors."""
+        resources = []
+        
+        for name, state in self._connectors.items():
+            if not state.enabled:
+                continue
+            
+            for resource in state.connector.get_resources():
+                resources.append({
+                    "uri": resource.uri,
+                    "name": resource.name,
+                    "description": resource.description,
+                    "mime_type": resource.mime_type,
+                    "connector": name,
+                    "requires_auth": resource.requires_auth,
+                })
+        
+        return resources
+    
+    def get_all_prompts(self) -> List[Dict[str, Any]]:
+        """Get all prompts from all registered connectors."""
+        prompts = []
+        
+        for name, state in self._connectors.items():
+            if not state.enabled:
+                continue
+            
+            for prompt in state.connector.get_prompts():
+                prompts.append({
+                    "name": prompt.name,
+                    "description": prompt.description,
+                    "arguments": prompt.arguments,
+                    "template": prompt.template,
+                    "connector": name,
+                    "requires_auth": prompt.requires_auth,
+                })
+        
+        return prompts
+    
+    async def read_resource(self, uri: str, user_token: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Read a resource by URI."""
+        # Find connector that owns this URI
+        for name, state in self._connectors.items():
+            if not state.enabled:
+                continue
+            
+            # Set token if provided
+            if user_token and hasattr(state.connector, "set_token"):
+                state.connector.set_token(user_token)
+            
+            result = await state.connector.read_resource(uri)
+            if result and "error" not in result:
+                return result
+        
+        return None
     
     def get_tool_schema(self, tool_name: str) -> Optional[Dict[str, Any]]:
         """Get JSON Schema for a specific tool."""
@@ -372,6 +502,35 @@ class ConnectorRegistry:
         
         return results
     
+    async def set_user_token_and_check(self, connector_name: str, token: str) -> Tuple[bool, str]:
+        """
+        Set a user's token for a connector and run a health check.
+        
+        This is useful when a user connects their OAuth token - we want to
+        immediately verify it's valid by running a health check.
+        
+        Returns:
+            (healthy, message)
+        """
+        connector = self.get_connector(connector_name)
+        if not connector:
+            return False, f"Connector '{connector_name}' not found"
+        
+        # Set the token on the connector
+        if hasattr(connector, "set_token"):
+            connector.set_token(token)
+        
+        # Run health check
+        try:
+            healthy, message = await connector.health_check()
+            state = self._connectors.get(connector_name)
+            if state:
+                state.healthy = healthy
+                state.last_health_check = datetime.now(timezone.utc)
+            return healthy, message
+        except Exception as e:
+            return False, f"Health check failed: {e}"
+    
     async def close_all(self) -> None:
         """Close all connectors."""
         for name, state in self._connectors.items():
@@ -414,7 +573,7 @@ async def initialize_connectors() -> ConnectorRegistry:
 
         config = ConnectorConfig(api_key=shared_key)
         connector = conn_class(config)
-        registry.register_connector(conn_name, connector, enabled=True)
+        await registry.register_connector_async(conn_name, connector, enabled=True)
 
         if shared_key:
             logger.info(f"Connector '{conn_name}' registered with shared credential")
@@ -424,7 +583,7 @@ async def initialize_connectors() -> ConnectorRegistry:
                 f"users must provide their own token via POST /v1/tokens)"
             )
 
-    # Start health checks only for connectors that have a shared credential
+    # Start health checks for all connectors (they'll check for tokens at runtime)
     await registry.start_health_checks()
 
     return registry

@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+{% block title %}Register - Relay{% endblock %}
+{% set show_sidebar = false %}
+{% block auth_content %}
+<div class="auth-container">
+    <div class="auth-card">
+        <div class="auth-header">
+            <svg width="40" height="40" viewBox="0 0 28 28" fill="none">
+                <rect width="28" height="28" rx="6" fill="#6366f1"/>
+                <path d="M8 14l4 4 8-8" stroke="white" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+            <h1>Create your account</h1>
+            <p>Get started with Relay in seconds</p>
+        </div>
+        <form action="/auth/register" method="post" class="auth-form" id="register-form">
+            <div class="form-group">
+                <label for="username">Username</label>
+                <input type="text" id="username" name="username" required minlength="3" pattern="[a-zA-Z0-9_]+" placeholder="Choose a username">
+                <span class="form-hint">Letters, numbers, and underscores only (min 3 characters)</span>
+            </div>
+            <div class="form-group">
+                <label for="email">Email (optional)</label>
+                <input type="email" id="email" name="email" placeholder="you@example.com">
+            </div>
+            <div class="form-group">
+                <label for="password">Password</label>
+                <input type="password" id="password" name="password" required minlength="8" placeholder="At least 8 characters">
+                <span class="form-hint">Minimum 8 characters</span>
+            </div>
+            <div class="form-group">
+                <label for="confirm_password">Confirm Password</label>
+                <input type="password" id="confirm_password" name="confirm_password" required minlength="8" placeholder="Confirm your password">
+            </div>
+            <div class="form-error" id="form-error" style="display:none;"></div>
+            <button type="submit" class="btn btn-primary btn-full" id="register-btn">Create Account</button>
+        </form>
+        <div class="auth-footer">
+            Already have an account? <a href="/auth/login">Sign in</a>
+        </div>
+    </div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+document.getElementById('register-form').addEventListener('submit', async function(e) {
+    e.preventDefault();
+    const btn = document.getElementById('register-btn');
+    const error = document.getElementById('form-error');
+    const pw = document.getElementById('password').value;
+    const confirm = document.getElementById('confirm_password').value;
+    error.style.display = 'none';
+    if (pw !== confirm) {
+        error.textContent = 'Passwords do not match';
+        error.style.display = 'block';
+        return;
+    }
+    btn.disabled = true;
+    btn.textContent = 'Creating account...';
+    try {
+        const resp = await fetch('/auth/register', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                username: document.getElementById('username').value,
+                email: document.getElementById('email').value || null,
+                password: pw,
+            }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+            error.textContent = data.detail || data.error || 'Registration failed';
+            error.style.display = 'block';
+            btn.disabled = false;
+            btn.textContent = 'Create Account';
+            return;
+        }
+        window.location.href = '/auth/login?registered=1';
+    } catch (err) {
+        error.textContent = 'Network error. Please try again.';
+        error.style.display = 'block';
+        btn.disabled = false;
+        btn.textContent = 'Create Account';
+    }
+});
+</script>
+{% endblock %}

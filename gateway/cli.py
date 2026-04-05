@@ -233,13 +233,55 @@ def cmd_github_search(args):
 def cmd_generate_pkce(args):
     """Generate PKCE code verifier and challenge."""
     from auth.oauth import generate_code_verifier, generate_code_challenge
-
+    
     verifier = generate_code_verifier(args.length)
     challenge = generate_code_challenge(verifier, args.method)
-
-    print(f"Code Verifier: {verifier}")
+    
+    print(f"Code Verifier:  {verifier}")
     print(f"Code Challenge: {challenge}")
-    print(f"Method: {args.method}")
+    print(f"Method:         {args.method}")
+
+
+def cmd_create_user(args):
+    """Create a new user account."""
+    import hashlib
+    import base64
+    import os
+    import secrets
+    from auth import database as db
+    
+    db.init_db()
+    
+    if len(args.password) < 8:
+        print("Error: Password must be at least 8 characters")
+        sys.exit(1)
+    
+    import re
+    if not re.match(r'^[a-zA-Z0-9_]+$', args.username):
+        print("Error: Username can only contain letters, numbers, and underscores")
+        sys.exit(1)
+    
+    salt = os.urandom(16)
+    dk = hashlib.pbkdf2_hmac("sha256", args.password.encode("utf-8"), salt, 100_000)
+    hashed_pw = base64.b64encode(salt + dk).decode("utf-8")
+    
+    user_id = f"usr_{secrets.token_urlsafe(12)}"
+    result = db.create_user(
+        user_id=user_id,
+        username=args.username,
+        hashed_password=hashed_pw,
+        email=args.email,
+    )
+    
+    if not result:
+        print(f"Error: Username '{args.username}' or email already exists")
+        sys.exit(1)
+    
+    print(f"User created successfully!")
+    print(f"  User ID:    {user_id}")
+    print(f"  Username:   {args.username}")
+    if args.email:
+        print(f"  Email:      {args.email}")
 
 
 def main():
@@ -336,6 +378,13 @@ Examples:
     pkce_parser.add_argument("--length", type=int, default=128, help="Code verifier length")
     pkce_parser.add_argument("--method", default="S256", help="Challenge method (S256 or plain)")
     pkce_parser.set_defaults(func=cmd_generate_pkce)
+    
+    # create-user
+    user_parser = subparsers.add_parser("create-user", help="Create a new user account")
+    user_parser.add_argument("--username", required=True, help="Username")
+    user_parser.add_argument("--password", required=True, help="Password (min 8 chars)")
+    user_parser.add_argument("--email", help="Email address (optional)")
+    user_parser.set_defaults(func=cmd_create_user)
     
     args = parser.parse_args()
     

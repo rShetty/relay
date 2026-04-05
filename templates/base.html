@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Relay{% endblock %}</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+    {% block head %}{% endblock %}
+</head>
+<body>
+    {% if show_sidebar %}
+    <div class="app-layout">
+        {% include "components/sidebar.html" %}
+        <main class="main-content">
+            <header class="topbar">
+                <div class="topbar-left">
+                    <h1 class="page-title">{% block page_title %}{% endblock %}</h1>
+                </div>
+                <div class="topbar-right" x-data="{ open: false }">
+                    <button class="user-menu-btn" @click="open = !open">
+                        <span class="user-avatar">{{ user.username[:1].upper() }}</span>
+                        <span class="user-name">{{ user.username }}</span>
+                        <svg class="chevron" :class="{ 'chevron-up': open }" viewBox="0 0 20 20" fill="currentColor">
+                            <path fill-rule="evenodd" d="M5.23 7.21a.75.75 0 011.06.02L10 11.168l3.71-3.938a.75.75 0 111.08 1.04l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 01.02-1.06z"/>
+                        </svg>
+                    </button>
+                    <div class="user-dropdown" x-show="open" @click.away="open = false" x-cloak>
+                        <a href="/settings" class="dropdown-item">Settings</a>
+                        <a href="/api-keys" class="dropdown-item">API Keys</a>
+                        <div class="dropdown-divider"></div>
+                        <form action="/auth/logout" method="post">
+                            <button type="submit" class="dropdown-item logout-item">Logout</button>
+                        </form>
+                    </div>
+                </div>
+            </header>
+            <div class="content">
+                {% block content %}{% endblock %}
+            </div>
+        </main>
+    </div>
+    {% else %}
+    <div class="auth-layout">
+        {% block auth_content %}{% endblock %}
+    </div>
+    {% endif %}
+    <script src="/static/js/app.js"></script>
+    {% block scripts %}{% endblock %}
+</body>
+</html>

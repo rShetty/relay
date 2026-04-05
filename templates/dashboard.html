@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+{% set show_sidebar = true %}
+{% set active_page = "dashboard" %}
+{% block page_title %}Dashboard{% endblock %}
+{% block content %}
+<div class="dashboard-grid">
+    <div class="stat-card">
+        <div class="stat-icon stat-icon-blue">
+            <svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M12.586 4.586a2 2 0 112.828 2.828l-3 3a2 2 0 01-2.828 0 1 1 0 00-1.414 1.414 4 4 0 005.656 0l3-3a4 4 0 00-5.656-5.656l-1.5 1.5a1 1 0 101.414 1.414l1.5-1.5zm-5 5a2 2 0 012.828 0 1 1 0 101.414-1.414 4 4 0 00-5.656 0l-3 3a4 4 0 105.656 5.656l1.5-1.5a1 1 0 10-1.414-1.414l-1.5 1.5a2 2 0 11-2.828-2.828l3-3z" clip-rule="evenodd"/></svg>
+        </div>
+        <div class="stat-info">
+            <span class="stat-value">{{ connected_count }}</span>
+            <span class="stat-label">Connected Services</span>
+        </div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-icon stat-icon-green">
+            <svg viewBox="0 0 20 20" fill="currentColor"><path d="M10 12a2 2 0 100-4 2 2 0 000 4z"/><path fill-rule="evenodd" d="M.458 10C1.732 5.943 5.522 3 10 3s8.268 2.943 9.542 7c-1.274 4.057-5.064 7-9.542 7S1.732 14.057.458 10zM14 10a4 4 0 11-8 0 4 4 0 018 0z" clip-rule="evenodd"/></svg>
+        </div>
+        <div class="stat-info">
+            <span class="stat-value">{{ total_tools }}</span>
+            <span class="stat-label">Available Tools</span>
+        </div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-icon stat-icon-purple">
+            <svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M18 8a6 6 0 01-7.743 5.743L10 14l-1 1-1 1H6v2H2v-4l4.257-4.257A6 6 0 1118 8zm-6-4a1 1 0 100 2 2 2 0 012 2 1 1 0 102 0 4 4 0 00-4-4z" clip-rule="evenodd"/></svg>
+        </div>
+        <div class="stat-info">
+            <span class="stat-value">{{ api_keys_count }}</span>
+            <span class="stat-label">API Keys</span>
+        </div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-icon stat-icon-orange">
+            <svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M3 3a1 1 0 000 2v8a2 2 0 002 2h2.586l-1.293 1.293a1 1 0 101.414 1.414L10 15.414l2.293 2.293a1 1 0 001.414-1.414L12.414 15H15a2 2 0 002-2V5a1 1 0 100-2H3zm11.707 4.707a1 1 0 00-1.414-1.414L10 9.586 8.707 8.293a1 1 0 00-1.414 0l-2 2a1 1 0 101.414 1.414L8 10.414l1.293 1.293a1 1 0 001.414 0l4-4z" clip-rule="evenodd"/></svg>
+        </div>
+        <div class="stat-info">
+            <span class="stat-value">{{ backends_count }}</span>
+            <span class="stat-label">Active Backends</span>
+        </div>
+    </div>
+</div>
+
+<div class="section">
+    <div class="section-header">
+        <h2>Quick Actions</h2>
+    </div>
+    <div class="quick-actions">
+        <a href="/connectors" class="action-card">
+            <svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm1-11a1 1 0 10-2 0v2H7a1 1 0 100 2h2v2a1 1 0 102 0v-2h2a1 1 0 100-2h-2V7z" clip-rule="evenodd"/></svg>
+            <div>
+                <h3>Connect a Service</h3>
+                <p>Link GitHub, Slack, Linear, and more</p>
+            </div>
+        </a>
+        <a href="/api-keys" class="action-card">
+            <svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M18 8a6 6 0 01-7.743 5.743L10 14l-1 1-1 1H6v2H2v-4l4.257-4.257A6 6 0 1118 8zm-6-4a1 1 0 100 2 2 2 0 012 2 1 1 0 102 0 4 4 0 00-4-4z" clip-rule="evenodd"/></svg>
+            <div>
+                <h3>Generate API Key</h3>
+                <p>Create keys for CLI and SDK access</p>
+            </div>
+        </a>
+        <a href="/docs" class="action-card">
+            <svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M6 2a2 2 0 00-2 2v12a2 2 0 002 2h8a2 2 0 002-2V7.414A2 2 0 0015.414 6L12 2.586A2 2 0 0010.586 2H6zm5 6a1 1 0 10-2 0v3.586l-1.293-1.293a1 1 0 10-1.414 1.414l3 3a1 1 0 001.414 0l3-3a1 1 0 00-1.414-1.414L11 11.586V8z" clip-rule="evenodd"/></svg>
+            <div>
+                <h3>View API Docs</h3>
+                <p>Explore endpoints and schemas</p>
+            </div>
+        </a>
+    </div>
+</div>
+
+<div class="section">
+    <div class="section-header">
+        <h2>Your Connectors</h2>
+        <a href="/connectors" class="link">View all</a>
+    </div>
+    <div class="connector-list">
+        {% for connector in connectors %}
+        <a href="/connectors/{{ connector.name }}" class="connector-item">
+            <div class="connector-item-icon {{ 'connected' if connector.connected else '' }}">
+                {{ connector.name[:1].upper() }}
+            </div>
+            <div class="connector-item-info">
+                <h3>{{ connector.display_name }}</h3>
+                <p>{{ connector.tools_count }} tools</p>
+            </div>
+            <span class="status-badge {{ 'status-connected' if connector.connected else 'status-disconnected' }}">
+                {{ 'Connected' if connector.connected else 'Not Connected' }}
+            </span>
+        </a>
+        {% endfor %}
+    </div>
+</div>
+{% endblock %}

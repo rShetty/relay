@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
-from .github import BaseConnector, ConnectorConfig, ToolDefinition
+from .github import BaseConnector, ConnectorConfig, ToolDefinition, ResourceDefinition, PromptDefinition
 
 logger = logging.getLogger(__name__)
 
@@ -34,9 +34,184 @@ class LinearConnector(BaseConnector):
     display_name = "Linear"
     description = "Linear issue tracking and project management"
     
+    TOOL_MAPPING = {
+        "create_issue": {
+            "name": "linear_create_issue",
+            "description": "Create a new Linear issue",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Issue title"},
+                    "description": {"type": "string", "description": "Issue description"},
+                    "team_id": {"type": "string", "description": "Team ID"},
+                    "priority": {"type": "integer", "description": "Priority (0-4)"},
+                    "status": {"type": "string", "description": "Status name"},
+                    "assignee_id": {"type": "string", "description": "User ID"},
+                },
+                "required": ["title", "team_id"],
+            },
+            "handler": "_create_issue",
+        },
+        "update_issue": {
+            "name": "linear_update_issue",
+            "description": "Update an existing Linear issue",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "issue_id": {"type": "string", "description": "Issue ID"},
+                    "title": {"type": "string"},
+                    "description": {"type": "string"},
+                    "priority": {"type": "integer"},
+                    "status": {"type": "string"},
+                    "assignee_id": {"type": "string"},
+                },
+                "required": ["issue_id"],
+            },
+            "handler": "_update_issue",
+        },
+        "list_issues": {
+            "name": "linear_list_issues",
+            "description": "List issues in a team or project",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "team_id": {"type": "string"},
+                    "project_id": {"type": "string"},
+                    "limit": {"type": "integer", "default": 50},
+                },
+            },
+            "handler": "_list_issues",
+        },
+        "get_issue": {
+            "name": "linear_get_issue",
+            "description": "Get a specific issue by ID",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "issue_id": {"type": "string"},
+                },
+                "required": ["issue_id"],
+            },
+            "handler": "_get_issue",
+        },
+        "list_teams": {
+            "name": "linear_list_teams",
+            "description": "List all teams in the workspace",
+            "parameters": {"type": "object", "properties": {}},
+            "handler": "_list_teams",
+        },
+        "list_projects": {
+            "name": "linear_list_projects",
+            "description": "List all projects",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "team_id": {"type": "string"},
+                    "limit": {"type": "integer", "default": 50},
+                },
+            },
+            "handler": "_list_projects",
+        },
+        "list_cycles": {
+            "name": "linear_list_cycles",
+            "description": "List cycles (sprints) for a team",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "team_id": {"type": "string"},
+                    "limit": {"type": "integer", "default": 20},
+                },
+                "required": ["team_id"],
+            },
+            "handler": "_list_cycles",
+        },
+        "create_comment": {
+            "name": "linear_create_comment",
+            "description": "Add a comment to an issue",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "issue_id": {"type": "string"},
+                    "body": {"type": "string", "description": "Comment body"},
+                },
+                "required": ["issue_id", "body"],
+            },
+            "handler": "_create_comment",
+        },
+        "list_users": {
+            "name": "linear_list_users",
+            "description": "List all users in the workspace",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "default": 50},
+                },
+            },
+            "handler": "_list_users",
+        },
+    }
+    
+    RESOURCE_MAPPING = {
+        "teams": {
+            "uri": "linear://teams",
+            "name": "Teams",
+            "description": "List all teams in the workspace",
+            "handler": "_list_teams_resource",
+        },
+        "projects": {
+            "uri": "linear://projects",
+            "name": "Projects",
+            "description": "List all projects",
+            "handler": "_list_projects_resource",
+        },
+        "my_issues": {
+            "uri": "linear://my_issues",
+            "name": "My Issues",
+            "description": "List issues assigned to current user",
+            "handler": "_list_my_issues_resource",
+        },
+    }
+    
+    PROMPT_MAPPING = {
+        "create_issue": {
+            "name": "Create Linear Issue",
+            "description": "Template for creating a Linear issue",
+            "arguments": [
+                {"name": "team_id", "description": "Team ID"},
+                {"name": "title", "description": "Issue title"},
+                {"name": "description", "description": "Issue description"},
+            ],
+            "template": """Create a Linear issue:
+
+Team: {team_id}
+Title: {title}
+Description:
+{description}
+
+Use the linear_create_issue tool to create this issue.""",
+        },
+        "summarize_project": {
+            "name": "Summarize Project",
+            "description": "Template for summarizing a project",
+            "arguments": [
+                {"name": "project_id", "description": "Project ID"},
+            ],
+            "template": """Get details of project {project_id} and summarize:
+- What is the project about?
+- Current status
+- Key issues
+
+Use linear_list_projects to find the project.""",
+        },
+    }
+    
     def __init__(self, config: ConnectorConfig):
         super().__init__(config)
         self.base_url = config.base_url or "https://api.linear.app/graphql"
+    
+    def set_token(self, token: str) -> None:
+        """Set the API token for this connector."""
+        self.config.api_key = token
     
     def _get_headers(self) -> Dict[str, str]:
         """Get headers for Linear API requests."""
@@ -46,163 +221,60 @@ class LinearConnector(BaseConnector):
         }
     
     def get_tools(self) -> List[ToolDefinition]:
-        """Return Linear tools."""
-        return [
-            ToolDefinition(
-                name="linear_create_issue",
-                description="Create a new Linear issue",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "title": {"type": "string", "description": "Issue title"},
-                        "description": {"type": "string", "description": "Issue description (markdown supported)"},
-                        "team_id": {"type": "string", "description": "Team ID"},
-                        "priority": {"type": "integer", "description": "Priority (0-4, 0=no priority, 1=urgent, 4=low)"},
-                        "status": {"type": "string", "description": "Status name (e.g., 'Backlog', 'Todo', 'In Progress', 'Done')"},
-                        "assignee_id": {"type": "string", "description": "User ID to assign"},
-                        "label_ids": {"type": "array", "items": {"type": "string"}, "description": "Label IDs"},
-                        "project_id": {"type": "string", "description": "Project ID"},
-                        "cycle_id": {"type": "string", "description": "Cycle ID"},
-                        "parent_id": {"type": "string", "description": "Parent issue ID for sub-issues"},
-                    },
-                    "required": ["title", "team_id"],
-                },
-                handler=self._create_issue,
-            ),
-            ToolDefinition(
-                name="linear_update_issue",
-                description="Update an existing Linear issue",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "issue_id": {"type": "string", "description": "Issue ID"},
-                        "title": {"type": "string"},
-                        "description": {"type": "string"},
-                        "priority": {"type": "integer"},
-                        "status": {"type": "string", "description": "Status name"},
-                        "assignee_id": {"type": "string"},
-                        "label_ids": {"type": "array", "items": {"type": "string"}},
-                        "project_id": {"type": "string"},
-                        "cycle_id": {"type": "string"},
-                    },
-                    "required": ["issue_id"],
-                },
-                handler=self._update_issue,
-            ),
-            ToolDefinition(
-                name="linear_get_issue",
-                description="Get details of a Linear issue",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "issue_id": {"type": "string", "description": "Issue ID"},
-                    },
-                    "required": ["issue_id"],
-                },
-                handler=self._get_issue,
-            ),
-            ToolDefinition(
-                name="linear_search_issues",
-                description="Search for Linear issues",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "description": "Search query"},
-                        "team_id": {"type": "string"},
-                        "assignee_id": {"type": "string"},
-                        "status": {"type": "string"},
-                        "priority": {"type": "integer"},
-                        "limit": {"type": "integer", "default": 20},
-                    },
-                },
-                handler=self._search_issues,
-            ),
-            ToolDefinition(
-                name="linear_list_teams",
-                description="List all teams",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "limit": {"type": "integer", "default": 50},
-                    },
-                },
-                handler=self._list_teams,
-            ),
-            ToolDefinition(
-                name="linear_list_projects",
-                description="List all projects",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "team_id": {"type": "string"},
-                        "limit": {"type": "integer", "default": 50},
-                    },
-                },
-                handler=self._list_projects,
-            ),
-            ToolDefinition(
-                name="linear_list_cycles",
-                description="List cycles (sprints) for a team",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "team_id": {"type": "string", "description": "Team ID"},
-                        "limit": {"type": "integer", "default": 20},
-                    },
-                    "required": ["team_id"],
-                },
-                handler=self._list_cycles,
-            ),
-            ToolDefinition(
-                name="linear_create_comment",
-                description="Add a comment to an issue",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "issue_id": {"type": "string"},
-                        "body": {"type": "string", "description": "Comment text (markdown supported)"},
-                    },
-                    "required": ["issue_id", "body"],
-                },
-                handler=self._create_comment,
-            ),
-            ToolDefinition(
-                name="linear_list_comments",
-                description="List comments on an issue",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "issue_id": {"type": "string"},
-                        "limit": {"type": "integer", "default": 50},
-                    },
-                    "required": ["issue_id"],
-                },
-                handler=self._list_comments,
-            ),
-            ToolDefinition(
-                name="linear_list_labels",
-                description="List available labels for a team",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "team_id": {"type": "string"},
-                        "limit": {"type": "integer", "default": 50},
-                    },
-                },
-                handler=self._list_labels,
-            ),
-            ToolDefinition(
-                name="linear_list_users",
-                description="List users in the workspace",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "limit": {"type": "integer", "default": 50},
-                    },
-                },
-                handler=self._list_users,
-            ),
-        ]
+        """Return Linear tools dynamically from TOOL_MAPPING."""
+        tools = []
+        for tool_key, tool_def in self.TOOL_MAPPING.items():
+            handler = getattr(self, tool_def["handler"], None)
+            if handler:
+                tools.append(ToolDefinition(
+                    name=tool_def["name"],
+                    description=tool_def["description"],
+                    parameters=tool_def["parameters"],
+                    handler=handler,
+                ))
+        return tools
+    
+    async def get_tools_async(self) -> List[ToolDefinition]:
+        """Return Linear tools (sync version for compatibility)."""
+        return self.get_tools()
+    
+    def get_resources(self) -> List[ResourceDefinition]:
+        """Return Linear resources from RESOURCE_MAPPING."""
+        resources = []
+        for res_key, res_def in self.RESOURCE_MAPPING.items():
+            handler = getattr(self, res_def["handler"], None)
+            if handler:
+                resources.append(ResourceDefinition(
+                    uri=res_def["uri"],
+                    name=res_def["name"],
+                    description=res_def["description"],
+                    read_handler=handler,
+                ))
+        return resources
+    
+    def get_prompts(self) -> List[PromptDefinition]:
+        """Return Linear prompts from PROMPT_MAPPING."""
+        prompts = []
+        for prompt_key, prompt_def in self.PROMPT_MAPPING.items():
+            prompts.append(PromptDefinition(
+                name=prompt_def["name"],
+                description=prompt_def["description"],
+                arguments=prompt_def.get("arguments", []),
+                template=prompt_def.get("template", ""),
+            ))
+        return prompts
+    
+    async def read_resource(self, uri: str) -> Optional[Dict[str, Any]]:
+        """Read a Linear resource by URI."""
+        resources = self.get_resources()
+        for resource in resources:
+            if resource.uri == uri and resource.read_handler:
+                try:
+                    result = await resource.read_handler()
+                    return result
+                except Exception as e:
+                    return {"error": str(e)}
+        return None
     
     # call_tool is inherited from BaseConnector
     
@@ -215,7 +287,12 @@ class LinearConnector(BaseConnector):
             if result.get("viewer"):
                 return True, f"Linear API accessible as {result['viewer'].get('name')}"
             return False, "Linear API returned no viewer data"
+        except httpx.ConnectError:
+            return False, "Cannot connect to Linear API"
         except Exception as e:
+            err_msg = str(e)
+            if "401" in err_msg or "unauthorized" in err_msg.lower():
+                return False, "Linear API requires authentication. Connect your account."
             return False, f"Linear API check failed: {e}"
     
     async def _graphql_query(self, query: str, variables: Optional[Dict] = None) -> Dict:
@@ -708,3 +785,90 @@ class LinearConnector(BaseConnector):
         except Exception as e:
             logger.warning(f"Failed to resolve status '{status_name}' for team {team_id}: {e}")
         return None
+    
+    # --- Resource Handlers ---
+    
+    async def _list_teams_resource(self) -> Dict[str, Any]:
+        """List teams (for resource)."""
+        query = """
+            query ListTeams($limit: Int) {
+                teams(first: $limit) {
+                    nodes {
+                        id
+                        name
+                        key
+                        description
+                    }
+                }
+            }
+        """
+        result = await self._graphql_query(query, {"limit": 50})
+        teams = result.get("teams", {}).get("nodes", [])
+        return {
+            "teams": [
+                {
+                    "id": t.get("id"),
+                    "name": t.get("name"),
+                    "key": t.get("key"),
+                    "description": t.get("description"),
+                }
+                for t in teams
+            ],
+        }
+    
+    async def _list_projects_resource(self) -> Dict[str, Any]:
+        """List projects (for resource)."""
+        query = """
+            query ListProjects($limit: Int) {
+                projects(first: $limit) {
+                    nodes {
+                        id
+                        name
+                        description
+                        status
+                    }
+                }
+            }
+        """
+        result = await self._graphql_query(query, {"limit": 50})
+        projects = result.get("projects", {}).get("nodes", [])
+        return {
+            "projects": [
+                {
+                    "id": p.get("id"),
+                    "name": p.get("name"),
+                    "description": p.get("description"),
+                    "status": p.get("status"),
+                }
+                for p in projects
+            ],
+        }
+    
+    async def _list_my_issues_resource(self) -> Dict[str, Any]:
+        """List issues assigned to current user (for resource)."""
+        query = """
+            query MyIssues($limit: Int) {
+                issues(filter: { assignee: { isMe: { eq: true } } }, first: $limit) {
+                    nodes {
+                        id
+                        identifier
+                        title
+                        state { name }
+                        priority
+                    }
+                }
+            }
+        """
+        result = await self._graphql_query(query, {"limit": 20})
+        issues = result.get("issues", {}).get("nodes", [])
+        return {
+            "issues": [
+                {
+                    "id": i.get("identifier"),
+                    "title": i.get("title"),
+                    "state": i.get("state", {}).get("name"),
+                    "priority": i.get("priority"),
+                }
+                for i in issues
+            ],
+        }
