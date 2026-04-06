@@ -199,6 +199,25 @@ def init_db() -> sqlite3.Connection:
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_access_req_user ON access_requests(user_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_access_req_status ON access_requests(status)")
+
+    # Installed Backends (admin-installed backends with global access)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS installed_backends (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            backend_id TEXT UNIQUE NOT NULL,
+            backend_name TEXT NOT NULL,
+            backend_type TEXT NOT NULL,  -- 'mcp_stdio', 'mcp_http', 'api_rest', 'api_graphql'
+            client_id TEXT NOT NULL,
+            client_secret TEXT NOT NULL,
+            config TEXT NOT NULL,  -- JSON config for backend (url, base_url, etc.)
+            enabled INTEGER DEFAULT 1,
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_installed_backends_id ON installed_backends(backend_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_installed_backends_enabled ON installed_backends(enabled)")
     
     conn.commit()
     logger.info(f"Database initialized at {get_db_path()}")
@@ -559,6 +578,15 @@ def create_user(
                     (user_id, connector_name, tools, is_default, created_at, updated_at)
                     VALUES (?, ?, ?, 1, ?, ?)
                 """, (user_id, perm["connector_name"], tools_json, now, now))
+            
+            # Apply permissions for all installed backends
+            installed_backends = list_installed_backends(include_disabled=False)
+            for backend in installed_backends:
+                conn.execute("""
+                    INSERT OR IGNORE INTO connector_permissions 
+                    (user_id, connector_name, tools, is_default, created_at, updated_at)
+                    VALUES (?, ?, NULL, 0, ?, ?)
+                """, (user_id, backend["backend_id"], now, now))
         
         conn.commit()
         return {
@@ -1154,3 +1182,104 @@ def get_user_allowed_tools(user_id: str, connector_name: str) -> Optional[List[s
     if perm is None:
         return None  # All tools allowed
     return perm.get("tools")
+
+
+# -----------------------------------------------------------------------------
+# Installed Backends (Admin-installed backends with global access)
+# -----------------------------------------------------------------------------
+
+def save_installed_backend(
+    backend_id: str,
+    backend_name: str,
+    backend_type: str,
+    client_id: str,
+    client_secret: str,
+    config: Dict[str, Any],
+    created_by: str,
+) -> None:
+    """Save or update an installed backend."""
+    conn = get_connection()
+    now = datetime.now(timezone.utc).isoformat()
+    encrypted_secret = encrypt_data(client_secret)
+    conn.execute("""
+        INSERT OR REPLACE INTO installed_backends
+        (backend_id, backend_name, backend_type, client_id, client_secret, config, enabled, created_by, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+    """, (backend_id, backend_name, backend_type, client_id, encrypted_secret, json.dumps(config), 
+          created_by, now, now))
+    conn.commit()
+
+
+def get_installed_backend(backend_id: str) -> Optional[Dict[str, Any]]:
+    """Get installed backend by ID."""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT * FROM installed_backends WHERE backend_id = ?",
+        (backend_id,)
+    ).fetchone()
+    if not row:
+        return None
+    return {
+        "id": row["id"],
+        "backend_id": row["backend_id"],
+        "backend_name": row["backend_name"],
+        "backend_type": row["backend_type"],
+        "client_id": row["client_id"],
+        "client_secret": decrypt_data(row["client_secret"]) if row["client_secret"] else None,
+        "config": json.loads(row["config"]),
+        "enabled": bool(row["enabled"]),
+        "created_by": row["created_by"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def list_installed_backends(include_disabled: bool = False) -> List[Dict[str, Any]]:
+    """List all installed backends."""
+    conn = get_connection()
+    if include_disabled:
+        rows = conn.execute(
+            "SELECT * FROM installed_backends ORDER BY created_at DESC"
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM installed_backends WHERE enabled = 1 ORDER BY created_at DESC"
+        ).fetchall()
+    
+    return [
+        {
+            "id": row["id"],
+            "backend_id": row["backend_id"],
+            "backend_name": row["backend_name"],
+            "backend_type": row["backend_type"],
+            "client_id": row["client_id"],
+            "enabled": bool(row["enabled"]),
+            "created_by": row["created_by"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+        for row in rows
+    ]
+
+
+def delete_installed_backend(backend_id: str) -> bool:
+    """Delete an installed backend."""
+    conn = get_connection()
+    cursor = conn.execute(
+        "DELETE FROM installed_backends WHERE backend_id = ?",
+        (backend_id,)
+    )
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def set_backend_enabled(backend_id: str, enabled: bool) -> bool:
+    """Enable or disable an installed backend."""
+    conn = get_connection()
+    now = datetime.now(timezone.utc).isoformat()
+    cursor = conn.execute(
+        "UPDATE installed_backends SET enabled = ?, updated_at = ? WHERE backend_id = ?",
+        (1 if enabled else 0, now, backend_id)
+    )
+    conn.commit()
+    return cursor.rowcount > 0

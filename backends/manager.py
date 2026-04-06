@@ -640,9 +640,33 @@ class BackendManager:
         if not definition.enabled:
             return False, f"Backend {backend_id} is disabled"
         
+        # Check if this is an admin-installed backend and load credentials
+        installed_backend_creds = None
+        try:
+            from auth.database import get_installed_backend
+            installed_backend = get_installed_backend(backend_id)
+            if installed_backend:
+                installed_backend_creds = installed_backend
+                # Update definition with config from database
+                config = installed_backend.get("config", {})
+                if config.get("url"):
+                    definition.url = config["url"]
+                if config.get("base_url"):
+                    definition.base_url = config["base_url"]
+                if config.get("auth_type"):
+                    definition.auth_type = config["auth_type"]
+                logger.info(f"Loaded configuration for installed backend: {backend_id}")
+        except Exception as e:
+            logger.warning(f"Could not load installed backend config for {backend_id}: {e}")
+        
         # Check for required credentials
         if definition.env_key and not os.getenv(definition.env_key):
-            return False, f"Missing required credential: {definition.env_key}"
+            # If this is an installed backend, use the stored client_secret
+            if installed_backend_creds and installed_backend_creds.get("client_secret"):
+                # Use stored credentials for installed backends
+                pass
+            else:
+                return False, f"Missing required credential: {definition.env_key}"
         
         start_time = time.time()
         
@@ -655,14 +679,25 @@ class BackendManager:
                 timeout=definition.connect_timeout,
             )
         elif definition.backend_type == BackendType.MCP_HTTP:
+            # Prepare headers with installed backend credentials if available
+            headers = definition.headers.copy()
+            if installed_backend_creds:
+                client_id = installed_backend_creds.get("client_id")
+                client_secret = installed_backend_creds.get("client_secret")
+                if client_id and client_secret:
+                    # Add basic auth header
+                    import base64
+                    auth_str = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+                    headers["Authorization"] = f"Basic {auth_str}"
+            
             success, error = await self._mcp_handler.connect_http(
                 backend_id=backend_id,
                 url=definition.url,
-                headers=definition.headers,
+                headers=headers,
                 timeout=definition.connect_timeout,
             )
         else:
-            # API backends don't need explicit connection
+            # API backends don\'t need explicit connection
             success, error = True, None
         
         latency_ms = (time.time() - start_time) * 1000
@@ -886,6 +921,104 @@ class BackendManager:
         timeout: int,
         user_token: Optional[str] = None,
     ) -> Tuple[bool, Any]:
+        """
+        Call a tool on an API backend by delegating to the connector\'s
+        tool-specific handler.  This avoids the old stub that blindly
+        POSTed to /{tool_name}.
+        """
+        from connectors import get_registry, ConnectorConfig
+
+        # Try to get credentials in this order: user_token, installed backend, env var
+        cred = user_token if user_token else None
+        
+        # Check if this is an admin-installed backend and use stored credentials
+        if not cred:
+            try:
+                from auth.database import get_installed_backend
+                installed_backend = get_installed_backend(definition.id)
+                if installed_backend:
+                    # For installed backends, use client_secret as the API key/token
+                    cred = installed_backend.get("client_secret")
+                    logger.debug(f"Using installed backend credentials for {definition.id}")
+            except Exception as e:
+                logger.warning(f"Could not load installed backend credentials for {definition.id}: {e}")
+        
+        # Fall back to environment variable
+        if not cred:
+            cred = os.getenv(definition.env_key, "")
+        
+        if not cred:
+            return False, (
+                f"No credentials for \'{definition.id}\'. "
+                f"Set {definition.env_key} or store a token via POST /v1/tokens."
+            )
+
+        connector_name = definition.connector or definition.id
+        registry = get_registry()
+        conn_class = registry.CONNECTOR_TYPES.get(connector_name)
+        if conn_class is None:
+            return False, f"No connector class for \'{connector_name}\'"
+
+        config = ConnectorConfig(api_key=cred, base_url=definition.base_url)
+        connector = conn_class(config)
+        try:
+            success, result = await connector.call_tool(tool_name, arguments)
+            return success, result
+        finally:
+            await connector.close()
+
+    async def _call_graphql_tool(
+        self,
+        definition: BackendDefinition,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        timeout: int,
+        user_token: Optional[str] = None,
+    ) -> Tuple[bool, Any]:
+        """
+        Call a tool on a GraphQL API backend by delegating to the connector\'s
+        tool-specific handler (which already knows how to build GraphQL queries).
+        """
+        from connectors import get_registry, ConnectorConfig
+
+        # Try to get credentials in this order: user_token, installed backend, env var
+        cred = user_token if user_token else None
+        
+        # Check if this is an admin-installed backend and use stored credentials
+        if not cred:
+            try:
+                from auth.database import get_installed_backend
+                installed_backend = get_installed_backend(definition.id)
+                if installed_backend:
+                    # For installed backends, use client_secret as the API key/token
+                    cred = installed_backend.get("client_secret")
+                    logger.debug(f"Using installed backend credentials for {definition.id}")
+            except Exception as e:
+                logger.warning(f"Could not load installed backend credentials for {definition.id}: {e}")
+        
+        # Fall back to environment variable
+        if not cred:
+            cred = os.getenv(definition.env_key, "")
+        
+        if not cred:
+            return False, (
+                f"No credentials for \'{definition.id}\'. "
+                f"Set {definition.env_key} or store a token via POST /v1/tokens."
+            )
+
+        connector_name = definition.connector or definition.id
+        registry = get_registry()
+        conn_class = registry.CONNECTOR_TYPES.get(connector_name)
+        if conn_class is None:
+            return False, f"No connector class for \'{connector_name}\'"
+
+        config = ConnectorConfig(api_key=cred, base_url=definition.base_url)
+        connector = conn_class(config)
+        try:
+            success, result = await connector.call_tool(tool_name, arguments)
+            return success, result
+        finally:
+            await connector.close()
         """
         Call a tool on an API backend by delegating to the connector's
         tool-specific handler.  This avoids the old stub that blindly

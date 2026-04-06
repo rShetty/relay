@@ -354,6 +354,41 @@ async def lifespan(app: FastAPI):
         )
         backends.register_backend(definition)
     
+    # Load and register admin-installed backends from database
+    from auth.database import list_installed_backends
+    installed_backends = list_installed_backends(include_disabled=False)
+    
+    backend_type_map = {
+        "mcp_stdio": BackendType.MCP_STDIO,
+        "mcp_http": BackendType.MCP_HTTP,
+        "api_rest": BackendType.API_REST,
+        "api_graphql": BackendType.API_GRAPHQL,
+    }
+    
+    for installed_backend in installed_backends:
+        backend_type = backend_type_map.get(installed_backend["backend_type"])
+        if not backend_type:
+            logger.warning(f"Unknown backend type for {installed_backend['backend_id']}: {installed_backend['backend_type']}")
+            continue
+        
+        # Note: We'll fetch the full config with client_secret when needed
+        # For now, create a basic definition
+        definition = BackendDefinition(
+            id=installed_backend["backend_id"],
+            name=installed_backend["backend_name"],
+            description=f"Admin-installed backend: {installed_backend['backend_name']}",
+            backend_type=backend_type,
+            enabled=True,
+            requires_auth=True,
+            connector=None,
+            tools=[],
+            url=None,  # Will be loaded from config when needed
+            base_url=None,  # Will be loaded from config when needed
+            auth_type=None,
+        )
+        backends.register_backend(definition)
+        logger.info(f"Registered installed backend from database: {installed_backend['backend_id']}")
+    
     await backends.start()
     
     # Initialize connectors from environment
@@ -1238,13 +1273,14 @@ async def admin_page(request: Request):
         raise HTTPException(status_code=403, detail="Admin access required")
     
     from auth.database import list_users, get_pending_access_requests, get_default_permissions
-    from auth.database import get_all_access_requests, get_all_user_permissions
+    from auth.database import get_all_access_requests, get_all_user_permissions, list_installed_backends
     
     users = list_users()
     pending_requests = get_pending_access_requests()
     all_requests = get_all_access_requests()
     default_perms = get_default_permissions()
     all_user_perms = get_all_user_permissions()
+    installed_backends = list_installed_backends(include_disabled=True)
     
     # Get available tools for each connector
     app_state = _get_state()
@@ -1278,6 +1314,7 @@ async def admin_page(request: Request):
         all_user_permissions=all_user_perms,
         connector_tools=connector_tools,
         user_permissions=all_user_perms,  # Pass for editing
+        installed_backends=installed_backends,
     )
 
 
@@ -1383,6 +1420,172 @@ async def reject_access_request(request_id: int, request: Request, note: Optiona
     review_access_request(request_id, user["id"], approved=False, note=note)
     
     return RedirectResponse(url="/admin", status_code=303)
+
+
+# -----------------------------------------------------------------------------
+# Admin Backend Installation Endpoints
+# -----------------------------------------------------------------------------
+
+class BackendInstallRequest(BaseModel):
+    """Backend installation request."""
+    backend_id: str
+    backend_name: str
+    backend_type: str  # 'mcp_stdio', 'mcp_http', 'api_rest', 'api_graphql'
+    client_id: str
+    client_secret: str
+    config: Dict[str, Any]  # Additional config like url, base_url, etc.
+
+
+@app.post("/admin/backends/install", tags=["Admin"])
+async def install_backend(req: BackendInstallRequest, current_user: Dict = Depends(get_current_session_user)):
+    """Install a new backend with client credentials."""
+    if not current_user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    from auth.database import save_installed_backend, set_connector_permission, list_users
+    from backends.manager import BackendDefinition, BackendType
+    
+    # Validate backend type
+    valid_types = ["mcp_stdio", "mcp_http", "api_rest", "api_graphql"]
+    if req.backend_type not in valid_types:
+        raise HTTPException(status_code=400, detail=f"Invalid backend_type. Must be one of: {valid_types}")
+    
+    # Validate required config fields based on backend type
+    if req.backend_type == "mcp_http" and "url" not in req.config:
+        raise HTTPException(status_code=400, detail="mcp_http backends require 'url' in config")
+    if req.backend_type in ["api_rest", "api_graphql"] and "base_url" not in req.config:
+        raise HTTPException(status_code=400, detail=f"{req.backend_type} backends require 'base_url' in config")
+    
+    # Save to database
+    save_installed_backend(
+        backend_id=req.backend_id,
+        backend_name=req.backend_name,
+        backend_type=req.backend_type,
+        client_id=req.client_id,
+        client_secret=req.client_secret,
+        config=req.config,
+        created_by=current_user["id"],
+    )
+    
+    # Set default permission for all users to access this backend
+    # We use the backend_id as the connector_name for permissions
+    all_users = list_users()
+    for user in all_users:
+        if user.get("is_active"):
+            set_connector_permission(
+                user_id=user["id"],
+                connector_name=req.backend_id,  # Use backend_id as connector name
+                tools=None,  # None means all tools allowed
+                is_default=False,
+                created_by=current_user["id"],
+            )
+    
+    # Dynamically register the backend
+    app_state = _get_state()
+    
+    # Map backend type string to enum
+    backend_type_map = {
+        "mcp_stdio": BackendType.MCP_STDIO,
+        "mcp_http": BackendType.MCP_HTTP,
+        "api_rest": BackendType.API_REST,
+        "api_graphql": BackendType.API_GRAPHQL,
+    }
+    
+    # Create backend definition with stored credentials
+    definition = BackendDefinition(
+        id=req.backend_id,
+        name=req.backend_name,
+        description=f"Installed backend: {req.backend_name}",
+        backend_type=backend_type_map[req.backend_type],
+        enabled=True,
+        requires_auth=True,
+        connector=None,
+        tools=[],
+        url=req.config.get("url"),
+        base_url=req.config.get("base_url"),
+        auth_type=req.config.get("auth_type"),
+    )
+    
+    app_state.backends.register_backend(definition)
+    
+    # Try to connect to the backend
+    success, error = await app_state.backends.connect_backend(req.backend_id)
+    
+    return {
+        "backend_id": req.backend_id,
+        "backend_name": req.backend_name,
+        "backend_type": req.backend_type,
+        "status": "connected" if success else "failed",
+        "error": error,
+        "users_with_access": len(all_users),
+    }
+
+
+@app.get("/admin/backends/installed", tags=["Admin"])
+async def list_installed_backends_api(current_user: Dict = Depends(get_current_session_user)):
+    """List all installed backends."""
+    if not current_user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    from auth.database import list_installed_backends
+    backends = list_installed_backends(include_disabled=True)
+    
+    return {"backends": backends}
+
+
+@app.delete("/admin/backends/{backend_id}", tags=["Admin"])
+async def uninstall_backend(backend_id: str, current_user: Dict = Depends(get_current_session_user)):
+    """Uninstall a backend."""
+    if not current_user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    from auth.database import delete_installed_backend
+    
+    # Disconnect from backend first
+    app_state = _get_state()
+    await app_state.backends.disconnect_backend(backend_id)
+    
+    # Unregister from backend manager
+    app_state.backends.unregister_backend(backend_id)
+    
+    # Delete from database
+    success = delete_installed_backend(backend_id)
+    
+    if not success:
+        raise HTTPException(status_code=404, detail="Backend not found")
+    
+    return {"message": f"Backend {backend_id} uninstalled successfully"}
+
+
+@app.post("/admin/backends/{backend_id}/toggle", tags=["Admin"])
+async def toggle_backend(backend_id: str, current_user: Dict = Depends(get_current_session_user)):
+    """Enable or disable a backend."""
+    if not current_user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    from auth.database import get_installed_backend, set_backend_enabled
+    
+    backend = get_installed_backend(backend_id)
+    if not backend:
+        raise HTTPException(status_code=404, detail="Backend not found")
+    
+    new_enabled = not backend["enabled"]
+    set_backend_enabled(backend_id, new_enabled)
+    
+    app_state = _get_state()
+    bstate = app_state.backends.get_backend(backend_id)
+    
+    if bstate:
+        bstate.definition.enabled = new_enabled
+        if new_enabled:
+            await app_state.backends.connect_backend(backend_id)
+        else:
+            await app_state.backends.disconnect_backend(backend_id)
+    
+    return {
+        "backend_id": backend_id,
+        "enabled": new_enabled,
+    }
 
 
 # -----------------------------------------------------------------------------

@@ -263,6 +263,7 @@
         <div class="admin-tabs">
             <button class="admin-tab active" onclick="showTab('users')">Users</button>
             <button class="admin-tab" onclick="showTab('requests')">Access Requests</button>
+            <button class="admin-tab" onclick="showTab('backends')">Backends</button>
             <button class="admin-tab" onclick="showTab('defaults')">Defaults</button>
         </div>
         
@@ -500,6 +501,76 @@
             {% endif %}
         </div>
         
+        <!-- Backends Tab -->
+        <div id="tab-backends" class="tab-content">
+            <div class="section-header">
+                <h2>Installed Backends</h2>
+                <button class="btn btn-primary" onclick="showInstallForm()">+ Install Backend</button>
+            </div>
+            
+            <!-- Install Backend Form -->
+            <div id="installBackendForm" style="display: none; background: var(--bg-card); padding: 24px; border-radius: var(--radius-lg); border: 1px solid var(--border-color); margin-bottom: 24px;">
+                <h3 style="margin-top: 0;">Install New Backend</h3>
+                <form id="backendInstallForm" onsubmit="installBackend(event)" style="display: grid; gap: 16px;">
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
+                        <div>
+                            <label style="font-size: 12px; color: var(--text-muted); display: block; margin-bottom: 4px;">Backend ID *</label>
+                            <input type="text" name="backend_id" required placeholder="e.g., custom-api" style="width: 100%; padding: 10px; background: var(--bg-secondary); border: 1px solid var(--border-color); border-radius: var(--radius); color: var(--text-primary);">
+                        </div>
+                        <div>
+                            <label style="font-size: 12px; color: var(--text-muted); display: block; margin-bottom: 4px;">Backend Name *</label>
+                            <input type="text" name="backend_name" required placeholder="e.g., Custom API" style="width: 100%; padding: 10px; background: var(--bg-secondary); border: 1px solid var(--border-color); border-radius: var(--radius); color: var(--text-primary);">
+                        </div>
+                    </div>
+                    <div>
+                        <label style="font-size: 12px; color: var(--text-muted); display: block; margin-bottom: 4px;">Backend Type *</label>
+                        <select name="backend_type" required onchange="updateConfigFields()" style="width: 100%; padding: 10px; background: var(--bg-secondary); border: 1px solid var(--border-color); border-radius: var(--radius); color: var(--text-primary);">
+                            <option value="">Select type</option>
+                            <option value="mcp_http">MCP HTTP</option>
+                            <option value="api_rest">API REST</option>
+                            <option value="api_graphql">API GraphQL</option>
+                        </select>
+                    </div>
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
+                        <div>
+                            <label style="font-size: 12px; color: var(--text-muted); display: block; margin-bottom: 4px;">Client ID *</label>
+                            <input type="text" name="client_id" required placeholder="Client ID for authentication" style="width: 100%; padding: 10px; background: var(--bg-secondary); border: 1px solid var(--border-color); border-radius: var(--radius); color: var(--text-primary);">
+                        </div>
+                        <div>
+                            <label style="font-size: 12px; color: var(--text-muted); display: block; margin-bottom: 4px;">Client Secret *</label>
+                            <input type="password" name="client_secret" required placeholder="Client secret for authentication" style="width: 100%; padding: 10px; background: var(--bg-secondary); border: 1px solid var(--border-color); border-radius: var(--radius); color: var(--text-primary);">
+                        </div>
+                    </div>
+                    <div id="configFields" style="display: grid; gap: 16px;">
+                        <!-- Dynamic config fields based on backend type -->
+                    </div>
+                    <div style="display: flex; gap: 8px; justify-content: flex-end;">
+                        <button type="button" class="btn" onclick="hideInstallForm()">Cancel</button>
+                        <button type="submit" class="btn btn-primary">Install Backend</button>
+                    </div>
+                </form>
+            </div>
+            
+            <!-- Backends List -->
+            <div id="backendsList" class="data-table-container">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Backend</th>
+                            <th>Type</th>
+                            <th>Status</th>
+                            <th>Created By</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="backendsTableBody">
+                        <!-- Will be populated by JavaScript -->
+                    </tbody>
+                </table>
+            </div>
+            <div id="backendsEmpty" class="empty-state" style="display: none;">No installed backends</div>
+        </div>
+        
         <!-- Default Permissions Tab -->
         <div id="tab-defaults" class="tab-content">
             <h2>Default Permissions</h2>
@@ -632,6 +703,198 @@
             const checkboxes = document.querySelectorAll('input[name="' + checkboxName + '"]:checked');
             document.getElementById(inputId).value = JSON.stringify(Array.from(checkboxes).map(cb => cb.value));
         }
+        
+        // Backend Management Functions
+        async function loadBackends() {
+            try {
+                const response = await fetch('/admin/backends/installed');
+                const data = await response.json();
+                renderBackends(data.backends || []);
+            } catch (error) {
+                console.error('Failed to load backends:', error);
+                document.getElementById('backendsTableBody').innerHTML = 
+                    '<tr><td colspan="5" style="text-align: center; color: var(--danger);">Failed to load backends</td></tr>';
+            }
+        }
+        
+        function renderBackends(backends) {
+            const tbody = document.getElementById('backendsTableBody');
+            const emptyDiv = document.getElementById('backendsEmpty');
+            
+            if (backends.length === 0) {
+                tbody.innerHTML = '';
+                emptyDiv.style.display = 'block';
+                return;
+            }
+            
+            emptyDiv.style.display = 'none';
+            tbody.innerHTML = backends.map(backend => `
+                <tr>
+                    <td>
+                        <div>
+                            <div style="font-weight: 500;">${backend.backend_name}</div>
+                            <div style="font-size: 12px; color: var(--text-muted);">${backend.backend_id}</div>
+                        </div>
+                    </td>
+                    <td>
+                        <span class="tool-tag">${backend.backend_type}</span>
+                    </td>
+                    <td>
+                        <span class="status-badge ${backend.enabled ? 'status-connected' : 'status-disconnected'}">
+                            ${backend.enabled ? 'Enabled' : 'Disabled'}
+                        </span>
+                    </td>
+                    <td style="color: var(--text-muted);">${backend.created_by || 'Unknown'}</td>
+                    <td>
+                        <div class="action-btns">
+                            <button class="btn btn-sm" onclick="toggleBackend('${backend.backend_id}')">
+                                ${backend.enabled ? 'Disable' : 'Enable'}
+                            </button>
+                            <button class="btn btn-sm btn-danger" onclick="deleteBackend('${backend.backend_id}')">Delete</button>
+                        </div>
+                    </td>
+                </tr>
+            `).join('');
+        }
+        
+        function showInstallForm() {
+            document.getElementById('installBackendForm').style.display = 'block';
+        }
+        
+        function hideInstallForm() {
+            document.getElementById('installBackendForm').style.display = 'none';
+            document.getElementById('backendInstallForm').reset();
+            document.getElementById('configFields').innerHTML = '';
+        }
+        
+        function updateConfigFields() {
+            const backendType = document.querySelector('select[name="backend_type"]').value;
+            const configFields = document.getElementById('configFields');
+            
+            let fields = '';
+            
+            if (backendType === 'mcp_http') {
+                fields = `
+                    <div>
+                        <label style="font-size: 12px; color: var(--text-muted); display: block; margin-bottom: 4px;">URL *</label>
+                        <input type="url" name="url" required placeholder="https://api.example.com/mcp" 
+                               style="width: 100%; padding: 10px; background: var(--bg-secondary); border: 1px solid var(--border-color); border-radius: var(--radius); color: var(--text-primary);">
+                    </div>
+                `;
+            } else if (backendType === 'api_rest' || backendType === 'api_graphql') {
+                fields = `
+                    <div>
+                        <label style="font-size: 12px; color: var(--text-muted); display: block; margin-bottom: 4px;">Base URL *</label>
+                        <input type="url" name="base_url" required placeholder="https://api.example.com" 
+                               style="width: 100%; padding: 10px; background: var(--bg-secondary); border: 1px solid var(--border-color); border-radius: var(--radius); color: var(--text-primary);">
+                    </div>
+                    <div>
+                        <label style="font-size: 12px; color: var(--text-muted); display: block; margin-bottom: 4px;">Auth Type</label>
+                        <select name="auth_type" style="width: 100%; padding: 10px; background: var(--bg-secondary); border: 1px solid var(--border-color); border-radius: var(--radius); color: var(--text-primary;">
+                            <option value="">None</option>
+                            <option value="bearer">Bearer Token</option>
+                            <option value="x-api-key">API Key Header</option>
+                            <option value="basic">Basic Auth</option>
+                        </select>
+                    </div>
+                `;
+            }
+            
+            configFields.innerHTML = fields;
+        }
+        
+        async function installBackend(event) {
+            event.preventDefault();
+            const form = event.target;
+            const formData = new FormData(form);
+            
+            const backendData = {
+                backend_id: formData.get('backend_id'),
+                backend_name: formData.get('backend_name'),
+                backend_type: formData.get('backend_type'),
+                client_id: formData.get('client_id'),
+                client_secret: formData.get('client_secret'),
+                config: {}
+            };
+            
+            // Add type-specific config
+            const url = formData.get('url');
+            const base_url = formData.get('base_url');
+            const auth_type = formData.get('auth_type');
+            
+            if (url) backendData.config.url = url;
+            if (base_url) backendData.config.base_url = base_url;
+            if (auth_type) backendData.config.auth_type = auth_type;
+            
+            try {
+                const response = await fetch('/admin/backends/install', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify(backendData)
+                });
+                
+                if (response.ok) {
+                    const result = await response.json();
+                    alert(`Backend installed successfully! ${result.status === 'connected' ? 'Connected' : 'Failed to connect'}`);
+                    hideInstallForm();
+                    loadBackends();
+                } else {
+                    const error = await response.json();
+                    alert('Failed to install backend: ' + (error.error || error.detail || 'Unknown error'));
+                }
+            } catch (error) {
+                alert('Failed to install backend: ' + error.message);
+            }
+        }
+        
+        async function toggleBackend(backendId) {
+            try {
+                const response = await fetch(`/admin/backends/${backendId}/toggle`, {
+                    method: 'POST'
+                });
+                
+                if (response.ok) {
+                    const result = await response.json();
+                    alert(`Backend ${result.enabled ? 'enabled' : 'disabled'} successfully`);
+                    loadBackends();
+                } else {
+                    const error = await response.json();
+                    alert('Failed to toggle backend: ' + (error.error || error.detail || 'Unknown error'));
+                }
+            } catch (error) {
+                alert('Failed to toggle backend: ' + error.message);
+            }
+        }
+        
+        async function deleteBackend(backendId) {
+            if (!confirm('Are you sure you want to delete this backend? This action cannot be undone.')) {
+                return;
+            }
+            
+            try {
+                const response = await fetch(`/admin/backends/${backendId}`, {
+                    method: 'DELETE'
+                });
+                
+                if (response.ok) {
+                    alert('Backend deleted successfully');
+                    loadBackends();
+                } else {
+                    const error = await response.json();
+                    alert('Failed to delete backend: ' + (error.error || error.detail || 'Unknown error'));
+                }
+            } catch (error) {
+                alert('Failed to delete backend: ' + error.message);
+            }
+        }
+        
+        // Load backends when backends tab is shown
+        document.addEventListener('DOMContentLoaded', function() {
+            // Pre-load backends data
+            loadBackends();
+        });
     </script>
     {% endblock %}
 </body>
