@@ -239,6 +239,7 @@ class RelayConfig(BaseSettings):
         env_prefix="RELAY_",
         env_nested_delimiter="__",
         case_sensitive=False,
+        extra="ignore",
     )
 
     # Environment
