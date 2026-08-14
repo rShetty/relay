@@ -22,6 +22,7 @@ class OAuthSettings(BaseSettings):
     # JWT signing
     jwt_secret_key: str = Field(default_factory=lambda: secrets.token_urlsafe(32))
     jwt_algorithm: str = "HS256"
+    jwt_public_key: Optional[str] = None  # Required when algorithm is RS256/ES256
     access_token_expire_minutes: int = 30
     refresh_token_expire_days: int = 7
     code_expire_minutes: int = 10
@@ -33,6 +34,7 @@ class OAuthSettings(BaseSettings):
     authorization_endpoint: str = "/oauth/authorize"
     token_endpoint: str = "/oauth/token"
     revoke_endpoint: str = "/oauth/revoke"
+    jwks_endpoint: str = "/oauth/jwks"
 
     # Allowed redirect URIs (for validation)
     allowed_redirect_uris: List[str] = Field(default_factory=lambda: [
@@ -42,6 +44,14 @@ class OAuthSettings(BaseSettings):
         "vscode://*",
         "cursor://*",
     ])
+
+    # SSO / OIDC configuration (enterprise identity providers)
+    sso_enabled: bool = False
+    sso_issuer: Optional[str] = None
+    sso_client_id: Optional[str] = None
+    sso_client_secret: Optional[str] = None
+    sso_scopes: List[str] = Field(default_factory=lambda: ["openid", "email", "profile"])
+    sso_callback_url: str = "http://localhost:8000/auth/sso/callback"
 
 
 class ConnectorOAuthConfig(BaseSettings):
@@ -56,33 +66,6 @@ class ConnectorOAuthConfig(BaseSettings):
 
 
 class GitHubOAuthSettings(BaseSettings):
-    """GitHub OAuth configuration."""
-    
-    client_id: Optional[str] = None
-    client_secret: Optional[str] = None
-    scopes: List[str] = Field(default_factory=lambda: ["repo", "read:user"])
-    callback_url: str = "http://localhost:8000/oauth/github/callback"
-
-
-class SlackOAuthSettings(BaseSettings):
-    """Slack OAuth configuration."""
-    
-    client_id: Optional[str] = None
-    client_secret: Optional[str] = None
-    scopes: List[str] = Field(default_factory=lambda: ["chat:write", "channels:read"])
-    callback_url: str = "http://localhost:8000/oauth/slack/callback"
-
-
-class LinearOAuthSettings(BaseSettings):
-    """Linear OAuth configuration."""
-    
-    client_id: Optional[str] = None
-    client_secret: Optional[str] = None
-    scopes: List[str] = Field(default_factory=lambda: ["read", "write"])
-    callback_url: str = "http://localhost:8000/oauth/linear/callback"
-
-
-class GitHubOAuthSettings(BaseSettings):
     """GitHub OAuth configuration for third-party service auth."""
 
     model_config = SettingsConfigDict(env_prefix="GITHUB_OAUTH_")
@@ -91,6 +74,28 @@ class GitHubOAuthSettings(BaseSettings):
     client_secret: Optional[str] = None
     scopes: List[str] = Field(default_factory=lambda: ["repo", "read:user"])
     callback_url: str = "http://localhost:8000/oauth/github/callback"
+
+
+class SlackOAuthSettings(BaseSettings):
+    """Slack OAuth configuration."""
+
+    model_config = SettingsConfigDict(env_prefix="SLACK_OAUTH_")
+
+    client_id: Optional[str] = None
+    client_secret: Optional[str] = None
+    scopes: List[str] = Field(default_factory=lambda: ["chat:write", "channels:read"])
+    callback_url: str = "http://localhost:8000/oauth/slack/callback"
+
+
+class LinearOAuthSettings(BaseSettings):
+    """Linear OAuth configuration."""
+
+    model_config = SettingsConfigDict(env_prefix="LINEAR_OAUTH_")
+
+    client_id: Optional[str] = None
+    client_secret: Optional[str] = None
+    scopes: List[str] = Field(default_factory=lambda: ["read", "write"])
+    callback_url: str = "http://localhost:8000/oauth/linear/callback"
 
 
 class SecuritySettings(BaseSettings):
@@ -102,6 +107,10 @@ class SecuritySettings(BaseSettings):
     rate_limit_enabled: bool = True
     rate_limit_requests_per_minute: int = 60
     rate_limit_requests_per_hour: int = 1000
+
+    # Auth attempt throttling
+    max_login_attempts: int = 5
+    lockout_duration_seconds: int = 900  # 15 minutes
 
     # Request validation
     max_request_size_bytes: int = 10 * 1024 * 1024  # 10 MB
@@ -115,6 +124,7 @@ class SecuritySettings(BaseSettings):
     # Audit logging
     audit_enabled: bool = True
     audit_log_path: str = "logs/audit.log"
+    audit_log_format: str = "jsonl"  # jsonl | syslog | cloudwatch
     audit_sensitive_fields: List[str] = Field(default_factory=lambda: [
         "password", "token", "secret", "key", "credential", "api_key"
     ])
@@ -122,6 +132,10 @@ class SecuritySettings(BaseSettings):
     # IP restrictions
     ip_whitelist: List[str] = Field(default_factory=list)
     ip_blacklist: List[str] = Field(default_factory=list)
+
+    # CSRF protection
+    csrf_enabled: bool = True
+    csrf_secret_key: str = Field(default_factory=lambda: secrets.token_urlsafe(32))
 
 
 class BackendSettings(BaseSettings):
@@ -167,6 +181,14 @@ class ServerSettings(BaseSettings):
     cors_methods: List[str] = Field(default_factory=lambda: ["GET", "POST", "OPTIONS"])
     cors_headers: List[str] = Field(default_factory=lambda: ["*"])
 
+    # Observability
+    enable_metrics: bool = True
+    metrics_path: str = "/metrics"
+    enable_tracing: bool = False
+    otlp_endpoint: Optional[str] = None  # e.g. http://localhost:4317
+    log_format: str = "json"  # json | text
+    log_level: str = "INFO"
+
     # MCP Server info
     server_name: str = "relay"
     server_version: str = "0.1.0"
@@ -182,12 +204,28 @@ class DatabaseSettings(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="DATABASE_")
 
-    # SQLite (default, local development)
+    # Database URL (PostgreSQL for production, SQLite for development)
+    # Examples:
+    #   postgresql+asyncpg://user:pass@localhost:5432/relay
+    #   sqlite:///data/gateway.db
+    url: Optional[str] = None
     sqlite_path: str = "data/gateway.db"
 
-    # Redis (for rate limiting, sessions, caching)
+    # Redis (for distributed rate limiting, sessions, caching)
     redis_url: Optional[str] = None
     redis_prefix: str = "relay:"
+
+    # Connection pool (for PostgreSQL)
+    pool_size: int = 10
+    max_overflow: int = 20
+    pool_timeout_seconds: int = 30
+
+    @property
+    def effective_url(self) -> str:
+        """Return the database URL to use — explicit URL or SQLite fallback."""
+        if self.url:
+            return self.url
+        return f"sqlite:///{self.sqlite_path}"
 
 
 class RelayConfig(BaseSettings):
@@ -225,6 +263,20 @@ class RelayConfig(BaseSettings):
         allowed = {"development", "staging", "production"}
         if v not in allowed:
             raise ValueError(f"environment must be one of {allowed}")
+        return v
+
+    @field_validator("oauth")
+    @classmethod
+    def validate_oauth_for_production(cls, v: OAuthSettings, info) -> OAuthSettings:
+        env = info.data.get("environment", "development")
+        if env == "production":
+            if v.jwt_algorithm == "HS256":
+                import warnings
+                warnings.warn(
+                    "HS256 is not recommended for production. "
+                    "Set OAUTH_JWT_ALGORITHM=RS256 and provide OAUTH_JWT_PUBLIC_KEY.",
+                    stacklevel=2,
+                )
         return v
 
     @property

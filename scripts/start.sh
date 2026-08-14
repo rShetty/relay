@@ -1,72 +1,53 @@
 #!/bin/bash
-# Relay Startup Script
 
+# Relay Gateway Startup Script
 set -e
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+cd "$(dirname "$0")/.."
 
-echo -e "${GREEN}=== Relay ===${NC}"
-echo ""
-
-# Check for .env file
-if [ ! -f .env ]; then
-    echo -e "${YELLOW}No .env file found. Creating default...${NC}"
-    cat > .env << EOF
-# Relay Configuration
-RELAY_ENVIRONMENT=development
-RELAY_SERVER__PORT=8000
-
-# OAuth (auto-generated in dev)
-RELAY_OAUTH__JWT_SECRET_KEY=$(openssl rand -hex 32)
-
-# Security
-RELAY_SECURITY__RATE_LIMIT_REQUESTS_PER_MINUTE=60
-RELAY_SECURITY__AUDIT_ENABLED=true
-RELAY_SECURITY__AUDIT_LOG_PATH=logs/audit.log
-
-# Backend Credentials (set these for backend access)
-# GITHUB_PERSONAL_ACCESS_TOKEN=ghp_xxx
-# OPENAI_API_KEY=sk-xxx
-# SLACK_BOT_TOKEN=xoxb-xxx
-EOF
-    echo -e "${GREEN}Created .env file with defaults${NC}"
+# Load environment variables
+if [ -f .env ]; then
+    export $(grep -v '^#' .env | xargs)
 fi
 
-# Load environment
-set -a
-source .env
-set +a
+# Check if venv exists
+if [ ! -d .venv ]; then
+    echo "Creating virtual environment..."
+    python3.11 -m venv .venv
+    source .venv/bin/activate
+    pip install --upgrade pip
+    pip install -e ".[dev]"
+else
+    source .venv/bin/activate
+fi
 
-# Create required directories
-mkdir -p logs data
+# Check if server is already running
+if lsof -Pi :8000 -sTCP:LISTEN -t >/dev/null 2>&1; then
+    echo "Relay gateway is already running on port 8000"
+    exit 1
+fi
 
-# Parse arguments
-MODE=${1:-http}
+# Start the server in the background
+echo "Starting Relay gateway on port 8000..."
+nohup python -m gateway.server http > server.log 2>&1 &
 
-case $MODE in
-    http|serve)
-        echo -e "${GREEN}Starting HTTP server...${NC}"
-        python -m gateway.server
-        ;;
-    mcp)
-        echo -e "${GREEN}Starting MCP server (stdio mode)...${NC}"
-        python -c "from gateway.server import run_mcp_server; run_mcp_server()"
-        ;;
-    docker)
-        echo -e "${GREEN}Starting with Docker Compose...${NC}"
-        docker-compose up --build
-        ;;
-    test)
-        echo -e "${GREEN}Running tests...${NC}"
-        pytest tests/ -v
-        ;;
-    *)
-        echo -e "${RED}Unknown mode: $MODE${NC}"
-        echo "Usage: $0 [http|mcp|docker|test]"
-        exit 1
-        ;;
-esac
+# Store the PID
+echo $! > server.pid
+
+# Wait a moment to check if it started successfully
+sleep 3
+
+if kill -0 $(cat server.pid) 2>/dev/null; then
+    echo "✅ Relay gateway started successfully (PID: $(cat server.pid))"
+    echo "📋 Logs: tail -f server.log"
+    echo "🛑 Stop: kill $(cat server.pid) && rm server.pid"
+    echo "🔗 Health check: curl http://localhost:8000/live"
+else
+    echo "❌ Failed to start Relay gateway"
+    if [ -f server.log ]; then
+        echo "Last few log lines:"
+        tail -10 server.log
+    fi
+    rm -f server.pid
+    exit 1
+fi

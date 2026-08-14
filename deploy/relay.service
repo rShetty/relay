@@ -1,0 +1,23 @@
+[Unit]
+Description=Relay MCP Gateway
+After=network-online.target redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=relay
+Group=relay
+EnvironmentFile=/etc/relay/relay.env
+WorkingDirectory=/opt/relay
+ExecStart=/opt/relay/.venv/bin/python -m gateway.server http
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/relay /opt/relay/logs
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

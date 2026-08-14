@@ -147,9 +147,11 @@ class JWTManager:
         algorithm: str = "HS256",
         access_token_expire_minutes: int = 30,
         refresh_token_expire_days: int = 7,
+        public_key: Optional[str] = None,
     ):
         self.secret_key = secret_key
         self.algorithm = algorithm
+        self.public_key = public_key or secret_key
         self.access_token_expire_minutes = access_token_expire_minutes
         self.refresh_token_expire_days = refresh_token_expire_days
         # jti -> expiry timestamp; cleaned up lazily on decode
@@ -239,7 +241,7 @@ class JWTManager:
         try:
             payload = jwt.decode(
                 token,
-                self.secret_key,
+                self.public_key,
                 algorithms=[self.algorithm],
             )
             
@@ -594,17 +596,10 @@ class OAuthProvider:
         """
         Authenticate a user.
 
-        For POC, accepts any username/password.
-        In production, verify against your user store.
+        Delegates to the database-backed user store. Returns None on
+        invalid credentials.
         """
-        # Demo: accept any credentials
-        user = User(
-            user_id=f"user_{secrets.token_urlsafe(8)}",
-            username=username,
-            scopes=["mcp:tools", "mcp:resources"],
-        )
-        self._users[user.user_id] = user
-        return user
+        return None  # DatabaseOAuthProvider overrides this
 
     def get_user(self, user_id: str) -> Optional[User]:
         """Get user by ID."""

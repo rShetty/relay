@@ -2,7 +2,7 @@
 # Multi-stage build for optimized image size
 
 # ---- Builder Stage ----
-FROM python:3.11-slim as builder
+FROM python:3.11-slim AS builder
 
 WORKDIR /app
 
@@ -35,7 +35,7 @@ COPY --from=builder /wheels /wheels
 RUN pip install --no-cache-dir /wheels/*.whl && rm -rf /wheels
 
 # Copy application code
-COPY . .
+COPY --chown=relay:relay . .
 
 # Create directories
 RUN mkdir -p logs data && chown -R relay:relay logs data
@@ -46,14 +46,17 @@ USER relay
 # Environment defaults
 ENV RELAY_ENVIRONMENT=production \
     RELAY_SERVER__HOST=0.0.0.0 \
-    RELAY_SERVER__PORT=8000
+    RELAY_SERVER__PORT=8000 \
+    RELAY_SERVER__LOG_FORMAT=json \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
 
 # Expose port
 EXPOSE 8000
 
 # Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:8000/live || exit 1
 
 # Default command
 CMD ["relay", "serve", "--host", "0.0.0.0", "--port", "8000"]

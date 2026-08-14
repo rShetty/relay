@@ -1,319 +1,99 @@
-# MCP Gateway - Security Architecture
+# Relay Security Architecture
 
 ## Overview
 
-This document describes the security architecture of the MCP Gateway, designed to provide secure, authenticated access to third-party services for MCP clients.
-
-## Threat Model
-
-### Assets Protected
-1. **User Credentials** - OAuth tokens, API keys
-2. **Backend Connections** - MCP server and API connections
-3. **Tool Call Data** - Arguments and results of tool invocations
-4. **Audit Logs** - Security event history
-
-### Threat Actors
-1. **External Attackers** - Network-level attacks, credential theft
-2. **Malicious Clients** - Rate limit abuse, injection attacks
-3. **Compromised Backends** - Supply chain attacks via MCP servers
-4. **Insider Threats** - Privilege escalation, data exfiltration
-
-### Attack Vectors
-
-| Vector | Mitigation |
-|--------|------------|
-| Credential interception | PKCE, TLS, short-lived tokens |
-| Authorization code replay | One-time codes, code binding |
-| Token theft | Token rotation, revocation |
-| Rate limit bypass | Per-client limits, sliding window |
-| SQL injection | Input validation, parameterized queries |
-| Command injection | Input validation, allowlists |
-| Path traversal | Input validation, sandboxed paths |
-| XSS | HTML sanitization, CSP headers |
-| SSRF | URL allowlists, no internal access |
-| DDoS | Rate limiting, IP restrictions |
-
-## Authentication Flow
-
-```
-┌─────────┐          ┌─────────┐          ┌─────────┐          ┌─────────┐
-│  Client │          │ Gateway │          │   User  │          │ Backend │
-└────┬────┘          └────┬────┘          └────┬────┘          └────┬────┘
-     │                    │                    │                    │
-     │ 1. Generate PKCE   │                    │                    │
-     │    verifier        │                    │                    │
-     │    challenge       │                    │                    │
-     │                    │                    │                    │
-     │ 2. Authorization   │                    │                    │
-     │    Request ────────►                    │                    │
-     │    + code_challenge │                    │                    │
-     │                    │                    │                    │
-     │                    │ 3. User consents   │                    │
-     │                    │    (auto for POC)  │                    │
-     │                    │                    │                    │
-     │                    │ 4. Auth Code ──────►                    │
-     │◄─────────────────── │                    │                    │
-     │                    │                    │                    │
-     │ 5. Token Request   │                    │                    │
-     │    + code_verifier │                    │                    │
-     │    ─────────────────►                    │                    │
-     │                    │                    │                    │
-     │                    │ 6. Verify PKCE     │                    │
-     │                    │    Create JWT      │                    │
-     │                    │                    │                    │
-     │ 7. Access Token    │                    │                    │
-     │◄─────────────────── │                    │                    │
-     │                    │                    │                    │
-     │ 8. Tool Call       │                    │                    │
-     │    + Bearer token  │                    │                    │
-     │    ─────────────────►                    │                    │
-     │                    │                    │                    │
-     │                    │ 9. Validate token  │                    │
-     │                    │    Check rate limit│                    │
-     │                    │    Sanitize input  │                    │
-     │                    │                    │                    │
-     │                    │ 10. Call backend   │                    │
-     │                    │     ──────────────────────────────────►│
-     │                    │                    │                    │
-     │                    │ 11. Result         │                    │
-     │                    │◄────────────────────────────────────── │
-     │                    │                    │                    │
-     │ 12. Response       │                    │                    │
-     │◄─────────────────── │                    │                    │
-     │                    │                    │                    │
-```
+Relay implements defense-in-depth security for enterprise deployments.
 
 ## Security Controls
 
-### 1. OAuth 2.1 with PKCE
+### Authentication
 
-**Purpose**: Prevent authorization code interception attacks
+| Control | Implementation |
+|---------|---------------|
+| OAuth 2.1 with PKCE | Full implementation with S256 code challenges |
+| JWT tokens | HS256 (dev) or RS256 (prod) with configurable expiry |
+| JWKS endpoint | `/oauth/jwks` for asymmetric key verification |
+| Session cookies | `HttpOnly`, `Secure` (prod), `SameSite=Strict` (prod) |
+| Account lockout | Configurable max attempts + lockout duration |
+| Password hashing | PBKDF2-HMAC-SHA256, 100K iterations |
+| SSO/OIDC | Configurable via `RELAY_OAUTH__SSO_*` settings |
 
-**Implementation**:
-- Code verifier: 128 random bytes (base64url encoded)
-- Code challenge: SHA256 hash of verifier
-- Challenge binding: Code bound to specific challenge
-- One-time codes: Codes invalidated after use
+### Authorization
 
-**Code**:
-```python
-def generate_code_verifier(length: int = 128) -> str:
-    charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
-    random_bytes = secrets.token_bytes(length)
-    return "".join(charset[b % len(charset)] for b in random_bytes)
+| Control | Implementation |
+|---------|---------------|
+| Per-user token isolation | Each user's third-party tokens stored separately |
+| Per-connector permissions | Granular tool-level access control |
+| Patroclus integration | Fail-closed per-tool policy checks |
+| Admin role | Separate admin role with elevated permissions |
+| Access requests | Users request access; admins approve/deny |
 
-def verify_code_verifier(verifier: str, challenge: str, method: str = "S256") -> bool:
-    expected = generate_code_challenge(verifier, method)
-    return secrets.compare_digest(expected, challenge)
-```
+### Encryption
 
-### 2. JWT Token Security
+| Control | Implementation |
+|---------|---------------|
+| Encryption at rest | Fernet (AES-128-CBC) for stored tokens |
+| Encryption in transit | TLS/SSL configurable, HSTS headers |
+| Encryption key | Required in production via `RELAY_ENCRYPTION_KEY` |
 
-**Purpose**: Stateless authentication with revocation support
+### Request Security
 
-**Implementation**:
-- Algorithm: HS256 (symmetric)
-- Token lifetime: 30 minutes (configurable)
-- Refresh tokens: 7 days, single-use
-- Token ID (jti): Unique identifier for revocation
+| Control | Implementation |
+|---------|---------------|
+| Rate limiting | Sliding window, Redis-backed for distributed deployments |
+| CSRF protection | Double-submit cookie pattern for web UI forms |
+| Security headers | CSP, X-Frame-Options, X-Content-Type-Options, HSTS |
+| Input validation | Pattern-based injection detection, size limits |
+| IP restrictions | Whitelist/blacklist with CIDR support |
 
-**Claims**:
-```json
-{
-  "sub": "user_abc123",
-  "client_id": "client_xyz789",
-  "scope": "mcp:tools mcp:resources",
-  "exp": 1704067200,
-  "iat": 1704065400,
-  "jti": "unique_token_id"
-}
-```
+### Audit & Compliance
 
-### 3. Rate Limiting
+| Control | Implementation |
+|---------|---------------|
+| Audit logging | All security events logged (JSONL format) |
+| Tamper-evidence | Hash-chained audit log entries |
+| Sensitive field redaction | Passwords, tokens, keys redacted in logs |
+| IP privacy | IP addresses SHA-256 hashed in logs |
+| GDPR right-to-erasure | `DELETE /auth/me` with cascading data deletion |
+| SOC2 alignment | Access controls, audit logging, encryption |
 
-**Purpose**: Prevent abuse and resource exhaustion
+## Production Deployment Checklist
 
-**Algorithm**: Sliding window
-- Maintains list of request timestamps per client
-- Cleans old entries every 100 requests
-- Blocks client for remainder of window when exceeded
-
-**Configuration**:
-- Per-minute: 60 requests (default)
-- Per-hour: 1000 requests (default)
-- Block duration: Remainder of window
-
-### 4. Input Validation
-
-**Purpose**: Prevent injection attacks
-
-**Patterns Detected**:
-- SQL injection: `SELECT`, `UNION`, `--`, `;`
-- Command injection: `&`, `|`, `$()`, backticks
-- Path traversal: `../`, `..\`
-- XSS: `<script>`, `javascript:`, event handlers
-
-**Implementation**:
-```python
-DANGEROUS_PATTERNS = [
-    r"(?i)(\b(union|select|insert|update|delete)\b.*\b(from|into)\b)",
-    r"[;&|`$](\s*\w+)+",
-    r"\.\./|\.\.\\",
-    r"<script[^>]*>",
-]
-```
-
-### 5. Audit Logging
-
-**Purpose**: Forensic analysis and compliance
-
-**Events Logged**:
-- OAuth flows (registration, authorization, token exchange)
-- Rate limit violations
-- Tool calls (with redacted sensitive fields)
-- IP-based access control decisions
-
-**Log Format**:
-```json
-{
-  "timestamp": "2024-01-01T00:00:00Z",
-  "event_type": "tool_call",
-  "client_id": "client_abc...",
-  "user_id": "user_123",
-  "ip_address": "a1b2c3d4...",  // SHA256 hashed
-  "resource": "search_repositories",
-  "action": "call",
-  "success": true,
-  "details": {
-    "arguments": {"query": "mcp"},
-    "result_summary": "Found 42 repositories"
-  }
-}
-```
-
-## Deployment Security
-
-### HTTPS/TLS
-
-**Development**: HTTP allowed on localhost
-**Production**: TLS 1.2+ required
-
-```bash
-# Generate self-signed cert for testing
-openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes
-
-# Configure
-MCP_GATEWAY_SERVER__SSL_ENABLED=true
-MCP_GATEWAY_SERVER__SSL_CERT_PATH=/path/to/cert.pem
-MCP_GATEWAY_SERVER__SSL_KEY_PATH=/path/to/key.pem
-```
-
-### Secrets Management
-
-**Never commit secrets to git!**
-
-**Recommended approaches**:
-1. Environment variables (via .env)
-2. Cloud secret managers (AWS Secrets Manager, GCP Secret Manager)
-3. HashiCorp Vault
-4. Kubernetes Secrets
-
-### Network Security
-
-**Recommended architecture**:
-```
-                    ┌─────────────────┐
-                    │   Load Balancer │
-                    │   (TLS Termination)
-                    └────────┬────────┘
-                             │
-              ┌──────────────┼──────────────┐
-              │              │              │
-        ┌─────▼─────┐  ┌─────▼─────┐  ┌─────▼─────┐
-        │  Gateway  │  │  Gateway  │  │  Gateway  │
-        │  Instance │  │  Instance │  │  Instance │
-        └─────┬─────┘  └─────┬─────┘  └─────┬─────┘
-              │              │              │
-              └──────────────┼──────────────┘
-                             │
-                    ┌────────▼────────┐
-                    │      Redis      │
-                    │  (Rate Limiting)│
-                    └─────────────────┘
-```
-
-### Container Security
-
-**Dockerfile best practices**:
-- Use minimal base image (python:3.11-slim)
-- Run as non-root user
-- Multi-stage build for smaller image
-- No secrets in image layers
-- Health checks enabled
-
-## Compliance Considerations
-
-### SOC 2 Type II
-- ✅ Access controls (OAuth)
-- ✅ Audit logging
-- ✅ Encryption in transit (TLS)
-- ⚠️ Encryption at rest (configure database encryption)
-
-### GDPR
-- ✅ Data minimization (hashed IPs in logs)
-- ✅ Purpose limitation (scope-based access)
-- ⚠️ Data retention policy (configure log rotation)
-- ⚠️ Right to erasure (implement user deletion)
-
-### HIPAA
-- ⚠️ BAA required for PHI
-- ⚠️ Additional safeguards needed
-
-## Security Checklist
-
-### Development
-- [ ] Use .env for secrets
-- [ ] Add .env to .gitignore
-- [ ] Enable debug logging
-- [ ] Use localhost-only binding
-
-### Staging
-- [ ] Rotate all secrets from dev
-- [ ] Enable TLS
-- [ ] Configure audit logging
-- [ ] Set up monitoring/alerting
-
-### Production
-- [ ] Use strong JWT secret (32+ bytes)
-- [ ] Enable TLS 1.2+
-- [ ] Configure IP allowlists
-- [ ] Set up log aggregation
-- [ ] Enable health checks
-- [ ] Configure backup/DR
-- [ ] Document incident response
-- [ ] Regular security audits
-- [ ] Penetration testing
+- [ ] Set `RELAY_ENVIRONMENT=production`
+- [ ] Set strong `RELAY_ENCRYPTION_KEY` (Fernet key)
+- [ ] Set strong `RELAY_OAUTH__JWT_SECRET_KEY`
+- [ ] Set `RELAY_OAUTH__JWT_ALGORITHM=RS256` and provide public key
+- [ ] Set `RELAY_SECURITY__CSRF_SECRET_KEY`
+- [ ] Enable TLS (configure reverse proxy with Let's Encrypt)
+- [ ] Configure Redis for distributed rate limiting
+- [ ] Configure PostgreSQL for multi-instance persistence
+- [ ] Set up audit log aggregation (ELK/Datadog/CloudWatch)
+- [ ] Configure Prometheus scraping of `/metrics`
+- [ ] Set up OpenTelemetry tracing (optional, via OTLP)
+- [ ] Configure IP allowlists if needed
+- [ ] Set up regular backup of encryption key and database
+- [ ] Document incident response procedures
+- [ ] Enable Patroclus integration for per-tool authorization
 
 ## Incident Response
 
 ### Token Compromise
 1. Revoke compromised tokens: `POST /oauth/revoke`
-2. Rotate JWT secret
+2. Rotate JWT secret and encryption key
 3. Force re-authorization for all clients
-4. Audit logs for unauthorized access
+4. Review audit logs for unauthorized access
 
 ### Backend Compromise
-1. Disable backend: `unregister_backend(id)`
+1. Disable backend via admin UI or `DELETE /admin/backends/{id}`
 2. Rotate backend credentials
 3. Audit tool calls via logs
 4. Notify affected users
 
 ### Rate Limit Evasion
-1. Identify pattern in logs
+1. Identify pattern in audit logs
 2. Add IP to blacklist
 3. Contact abuse team
-4. Consider CAPTCHA for registration
 
-## Contact
+## Security Contact
 
 Security issues: security@example.com

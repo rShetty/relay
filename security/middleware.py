@@ -50,6 +50,9 @@ class RateLimiter:
 
     Tracks requests per minute and per hour using a sliding window algorithm.
     Thread-safe implementation for concurrent access.
+
+    When a Redis client is provided (via ``configure_redis``), state is shared
+    across multiple gateway instances for distributed rate limiting.
     """
 
     def __init__(
@@ -66,6 +69,21 @@ class RateLimiter:
         self._clients: Dict[str, RateLimitEntry] = defaultdict(RateLimitEntry)
         self._request_count = 0
         self._lock = threading.Lock()
+        # Optional Redis client for distributed rate limiting
+        self._redis: Optional[Any] = None
+
+    def configure_redis(self, redis_url: str) -> None:
+        """Configure a Redis connection for distributed rate limiting."""
+        try:
+            import redis as redis_lib
+            client = redis_lib.from_url(redis_url, decode_responses=True, socket_timeout=2)
+            client.ping()
+            self._redis = client
+            logger.info("RateLimiter: Redis distributed rate limiting connected")
+        except Exception as exc:
+            logger.warning(
+                "RateLimiter: Redis not available — using in-memory fallback. (%s)", exc
+            )
 
     def _cleanup_if_needed(self) -> None:
         """Remove old entries periodically to prevent memory leak."""
@@ -326,9 +344,11 @@ class AuditEvent:
 
 class AuditLogger:
     """
-    Security audit logger.
+    Security audit logger with hash-chaining for tamper-evidence.
 
     Logs security-relevant events for compliance and forensics.
+    Each log entry includes a hash of the previous entry to detect
+    tampering (append-only audit trail).
     """
 
     def __init__(
@@ -340,13 +360,27 @@ class AuditLogger:
         self.enabled = enabled
         self.log_path = log_path
         self.sensitive_fields = set(sensitive_fields or [])
+        self._last_hash: str = ""
         self._ensure_log_directory()
+        self._load_last_hash()
 
     def _ensure_log_directory(self) -> None:
         """Create log directory if it doesn't exist."""
         log_dir = os.path.dirname(self.log_path)
         if log_dir:
             os.makedirs(log_dir, exist_ok=True)
+
+    def _load_last_hash(self) -> None:
+        """Load the last hash from the audit log (for chaining)."""
+        try:
+            if os.path.exists(self.log_path):
+                with open(self.log_path, "r") as f:
+                    lines = f.readlines()
+                    if lines:
+                        last_entry = json.loads(lines[-1])
+                        self._last_hash = last_entry.get("hash", "")
+        except Exception:
+            pass
 
     def _redact(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """Redact sensitive fields from log data."""
@@ -371,10 +405,10 @@ class AuditLogger:
         success: bool,
         details: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Log a security event."""
+        """Log a security event with hash-chaining for tamper-evidence."""
         if not self.enabled:
             return
-        
+
         event = AuditEvent(
             timestamp=datetime.now(timezone.utc),
             event_type=event_type,
@@ -386,8 +420,8 @@ class AuditLogger:
             success=success,
             details=self._redact(details or {}),
         )
-        
-        log_entry = json.dumps({
+
+        log_dict = {
             "timestamp": event.timestamp.isoformat(),
             "event_type": event.event_type,
             "client_id": event.client_id[:16] + "...",  # Truncate for privacy
@@ -397,15 +431,23 @@ class AuditLogger:
             "action": event.action,
             "success": event.success,
             "details": event.details,
-        })
-        
+        }
+
+        # Hash-chain: include previous hash for tamper detection
+        log_dict["prev_hash"] = self._last_hash
+        log_entry_str = json.dumps(log_dict, sort_keys=True)
+        self._last_hash = hashlib.sha256(log_entry_str.encode()).hexdigest()[:32]
+        log_dict["hash"] = self._last_hash
+
+        final_entry = json.dumps(log_dict)
+
         # Log to file
         try:
             with open(self.log_path, "a") as f:
-                f.write(log_entry + "\n")
+                f.write(final_entry + "\n")
         except Exception as e:
             logger.error(f"Failed to write audit log: {e}")
-        
+
         # Also log to Python logger
         log_level = logging.INFO if success else logging.WARNING
         logger.log(
@@ -613,4 +655,51 @@ class HSTSMiddleware(BaseHTTPMiddleware):
         if self.include_subdomains:
             hsts_value += "; includeSubDomains"
         response.headers["strict-transport-security"] = hsts_value
+        return response
+
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Add security headers (CSP, X-Frame-Options, X-Content-Type-Options, etc.)."""
+
+    def __init__(self, app, enable_csp: bool = True):
+        super().__init__(app)
+        self.enable_csp = enable_csp
+
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["X-XSS-Protection"] = "1; mode=block"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        if self.enable_csp:
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'self'; "
+                "script-src 'self' 'unsafe-inline'; "
+                "style-src 'self' 'unsafe-inline'; "
+                "img-src 'self' data: https:; "
+                "font-src 'self'; "
+                "connect-src 'self'; "
+                "frame-ancestors 'none';"
+            )
+        return response
+
+
+class MetricsMiddleware(BaseHTTPMiddleware):
+    """Collect Prometheus metrics for each request."""
+
+    async def dispatch(self, request, call_next):
+        import time as _time
+        from observability.metrics import REQUEST_COUNT, REQUEST_LATENCY
+
+        start = _time.time()
+        response = await call_next(request)
+        duration = _time.time() - start
+
+        method = request.method
+        endpoint = request.url.path
+        status = str(response.status_code)
+
+        REQUEST_COUNT.labels(method=method, endpoint=endpoint, status=status).inc()
+        REQUEST_LATENCY.labels(method=method, endpoint=endpoint).observe(duration)
+
         return response

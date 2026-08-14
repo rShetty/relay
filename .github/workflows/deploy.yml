@@ -1,0 +1,245 @@
+name: Deploy Relay Gateway
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: relay-production
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Lint with ruff
+        run: ruff check .
+
+      - name: Format check with black
+        run: black --check .
+
+      - name: Test with pytest
+        run: pytest tests/ -v
+
+      - name: Scan tracked files for credentials
+        shell: bash
+        run: |
+          if git grep -n -I -E 'BEGIN (RSA|OPENSSH|EC) PRIVATE KEY|RELAY_ENCRYPTION_KEY[[:space:]]*=[[:space:]]]*(gAAAA|Fernet)' -- ':!.github/workflows/' ':!README.md' ':!.env.example' ':!ENTERPRISE.md' ':!SECURITY.md'; then
+            exit 1
+          fi
+
+  security:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: pip-audit
+        run: |
+          pip install pip-audit
+          pip-audit --strict
+
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+
+  deploy:
+    needs: [verify, security]
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: 22
+          timeout: 120s
+          command_timeout: 30m
+          script: |
+            set -euo pipefail
+
+            # ── Secrets from GitHub ──────────────────────────────────
+            RELAY_ENCRYPTION_KEY="${{ secrets.RELAY_ENCRYPTION_KEY }}"
+            RELAY_OAUTH__JWT_SECRET_KEY="${{ secrets.RELAY_JWT_SECRET_KEY }}"
+            RELAY_SECURITY__CSRF_SECRET_KEY="${{ secrets.RELAY_CSRF_SECRET_KEY }}"
+            GITHUB_PAT="${{ secrets.GITHUB_PAT }}"
+            OPENAI_API_KEY="${{ secrets.OPENAI_API_KEY }}"
+            SLACK_BOT_TOKEN="${{ secrets.SLACK_BOT_TOKEN }}"
+            PATROCLUS_ENABLED="${{ secrets.PATROCLUS_ENABLED || 'false' }}"
+            PATROCLUS_URL="${{ secrets.PATROCLUS_URL || 'http://localhost:8484' }}"
+
+            # ── Clone or update repo ─────────────────────────────────
+            if [ ! -d /opt/relay/.git ]; then
+              rm -rf /opt/relay
+              git clone https://github.com/rShetty/relay.git /opt/relay
+            fi
+
+            cd /opt/relay
+            git fetch origin main
+            git reset --hard origin/main
+            git clean -fd
+
+            # ── Write environment file ───────────────────────────────
+            mkdir -p /etc/relay
+            if [ -f /etc/relay/relay.env ]; then
+              cp /etc/relay/relay.env /etc/relay/relay.env.bak
+            else
+              : > /etc/relay/relay.env
+            fi
+
+            cat > /etc/relay/relay.env << EOF
+            RELAY_ENVIRONMENT=production
+            RELAY_SERVER__HOST=0.0.0.0
+            RELAY_SERVER__PORT=8000
+            RELAY_SERVER__LOG_FORMAT=json
+            RELAY_SERVER__LOG_LEVEL=INFO
+            RELAY_ENCRYPTION_KEY=${RELAY_ENCRYPTION_KEY}
+            RELAY_OAUTH__JWT_SECRET_KEY=${RELAY_OAUTH__JWT_SECRET_KEY}
+            RELAY_OAUTH__JWT_ALGORITHM=HS256
+            RELAY_SECURITY__CSRF_ENABLED=true
+            RELAY_SECURITY__CSRF_SECRET_KEY=${RELAY_SECURITY__CSRF_SECRET_KEY}
+            RELAY_SECURITY__AUDIT_ENABLED=true
+            RELAY_SECURITY__AUDIT_LOG_PATH=/var/lib/relay/logs/audit.log
+            RELAY_DATABASE__SQLITE_PATH=/var/lib/relay/data/gateway.db
+            RELAY_DATABASE__REDIS_URL=redis://127.0.0.1:6379/0
+            GITHUB_PERSONAL_ACCESS_TOKEN=${GITHUB_PAT}
+            OPENAI_API_KEY=${OPENAI_API_KEY}
+            SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN}
+            PATROCLUS_ENABLED=${PATROCLUS_ENABLED}
+            PATROCLUS_URL=${PATROCLUS_URL}
+            EOF
+            chmod 600 /etc/relay/relay.env
+
+            # ── Create relay user ────────────────────────────────────
+            id relay >/dev/null 2>&1 || useradd --system --home-dir /var/lib/relay --create-home --shell /usr/sbin/nologin relay
+
+            # ── Create data and log directories ──────────────────────
+            mkdir -p /var/lib/relay/data /var/lib/relay/logs
+            chown -R relay:relay /var/lib/relay
+
+            # ── Install Python + dependencies ────────────────────────
+            export HOME=/root
+            if ! command -v python3.11 &>/dev/null; then
+              add-apt-repository -y ppa:deadsnakes/ppa
+              apt-get update
+              apt-get install -y python3.11 python3.11-venv python3.11-dev
+            fi
+
+            cd /opt/relay
+            python3.11 -m venv /opt/relay/.venv
+            source /opt/relay/.venv/bin/activate
+            pip install --upgrade pip
+            pip install -e ".[dev]"
+
+            # ── Initialize database ──────────────────────────────────
+            export $(grep -v '^#' /etc/relay/relay.env | xargs)
+            python -c "from auth.database import init_db; init_db()"
+
+            # ── Ensure Redis is running ──────────────────────────────
+            if ! command -v redis-server &>/dev/null; then
+              apt-get install -y redis-server
+              systemctl enable redis-server
+              systemctl start redis-server
+            fi
+
+            # ── Install systemd unit ─────────────────────────────────
+            cp /opt/relay/deploy/relay.service /etc/systemd/system/relay.service
+            systemctl daemon-reload
+            systemctl enable relay
+
+            # ── Restart service ──────────────────────────────────────
+            systemctl restart relay
+
+            # ── Health check with retries ────────────────────────────
+            sleep 5
+            for i in 1 2 3 4 5; do
+              if curl -sf http://127.0.0.1:8000/live; then
+                echo ""
+                echo "DEPLOY SUCCESS: relay is healthy"
+                exit 0
+              fi
+              echo "Health check attempt $i failed, waiting..."
+              sleep 5
+            done
+
+            echo "ERROR: Health check failed"
+            journalctl -u relay -n 30 --no-pager
+            exit 1
+
+      - name: Retry deploy (1)
+        if: failure()
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: 22
+          timeout: 120s
+          command_timeout: 30m
+          script: |
+            set -euo pipefail
+            cd /opt/relay
+            git fetch origin main
+            git reset --hard origin/main
+            git clean -fd
+            source /opt/relay/.venv/bin/activate
+            pip install -e ".[dev]"
+            systemctl restart relay
+            sleep 5
+            curl -sf http://127.0.0.1:8000/live && echo "DEPLOY SUCCESS (retry 1)" || (journalctl -u relay -n 20 --no-pager && exit 1)
+
+      - name: Retry deploy (2)
+        if: failure()
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: 22
+          timeout: 120s
+          command_timeout: 30m
+          script: |
+            set -euo pipefail
+            systemctl restart relay
+            sleep 5
+            curl -sf http://127.0.0.1:8000/live && echo "DEPLOY SUCCESS (retry 2)" || (journalctl -u relay -n 20 --no-pager && exit 1)

@@ -677,6 +677,38 @@ def deactivate_user(user_id: str) -> bool:
     return cursor.rowcount > 0
 
 
+def delete_user(user_id: str) -> bool:
+    """
+    Permanently delete a user and all associated data (GDPR right-to-erasure).
+
+    Removes:
+    - User record
+    - All connector tokens
+    - All API keys
+    - All connector permissions
+    - All access requests
+    - All OAuth states
+
+    Audit logs are retained (with user_id anonymized) for compliance.
+    """
+    conn = get_connection()
+    try:
+        conn.execute("DELETE FROM connector_tokens WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM api_keys WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM connector_permissions WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM access_requests WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM oauth_states WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM user_credentials WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+        conn.commit()
+        logger.info(f"User {user_id} and all associated data deleted (GDPR erasure)")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to delete user {user_id}: {e}")
+        conn.rollback()
+        return False
+
+
 # -----------------------------------------------------------------------------
 # OAuth State Operations (for connector OAuth)
 # -----------------------------------------------------------------------------

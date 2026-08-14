@@ -11,34 +11,55 @@ services:
       - RELAY_ENVIRONMENT=production
       - RELAY_SERVER__HOST=0.0.0.0
       - RELAY_SERVER__PORT=8000
-      - RELAY_OAUTH__JWT_SECRET_KEY=${JWT_SECRET_KEY:-change-me-in-production}
+      - RELAY_SERVER__LOG_FORMAT=json
+      - RELAY_OAUTH__JWT_SECRET_KEY=${JWT_SECRET_KEY:?JWT_SECRET_KEY is required}
+      - RELAY_ENCRYPTION_KEY=${RELAY_ENCRYPTION_KEY:?RELAY_ENCRYPTION_KEY is required}
       - RELAY_SECURITY__AUDIT_ENABLED=true
       - RELAY_SECURITY__AUDIT_LOG_PATH=/app/logs/audit.log
-      # Backend credentials (set in .env or here)
+      - RELAY_SECURITY__CSRF_ENABLED=true
+      - RELAY_DATABASE__REDIS_URL=redis://redis:6379/0
+      # Backend credentials (set in .env)
       - GITHUB_PERSONAL_ACCESS_TOKEN=${GITHUB_PAT:-}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN:-}
+      # Patroclus integration (optional)
+      - PATROCLUS_ENABLED=${PATROCLUS_ENABLED:-false}
+      - PATROCLUS_URL=${PATROCLUS_URL:-http://patroclus:8484}
     volumes:
       - ./logs:/app/logs
       - ./data:/app/data
+    depends_on:
+      redis:
+        condition: service_healthy
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8000/live"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 5s
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 256M
 
-  # Optional: Redis for distributed rate limiting
   redis:
     image: redis:7-alpine
     ports:
       - "6379:6379"
     volumes:
       - redis-data:/data
-    command: redis-server --appendonly yes
-    profiles:
-      - production
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
 volumes:
   redis-data:

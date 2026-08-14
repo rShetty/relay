@@ -55,6 +55,9 @@ data/
 *.key
 secrets/
 credentials/
+cookies.txt
+*.cookie
+*.session
 
 # OS
 .DS_Store

@@ -1,17 +1,23 @@
 # Relay
 
-**OAuth-authenticated MCP proxy for connecting MCP clients to third-party services.**
+**Enterprise-grade OAuth-authenticated MCP proxy for connecting MCP clients to third-party services.**
 
 An MCP Gateway acts as a middle layer between MCP clients (like Cursor, Claude Code, Windsurf, OpenCode, Gemini CLI) and third-party services. It provides:
 
 - **Multi-User System** - Signup/login with API keys for each user
 - **OAuth 2.1 Authentication** with PKCE for secure client authentication
-- **Per-User Token Management** - Each user gets their own third-party tokens (GitHub, Slack, Linear, etc.)
+- **RS256 JWT Support** with JWKS endpoint for asymmetric key verification
+- **SSO/OIDC Integration** - Connect to Okta, Azure AD, Google Workspace
+- **Per-User Token Management** - Each user gets their own third-party tokens
 - **Per-User MCP Endpoints** - Connect MCP clients using API key in URL path
 - **Backend Aggregation** - Connect to MCP servers OR direct APIs with OAuth support
 - **Dynamic Tool Discovery** - Tools auto-discovered from all connectors
-- **Resources & Prompts** - MCP Resources and Prompts from connectors
-- **Security Layer** - Rate limiting, input validation, audit logging
+- **Security Layer** - Rate limiting, CSRF protection, input validation, audit logging
+- **Enterprise Observability** - Structured JSON logging, Prometheus metrics, OpenTelemetry tracing
+- **Tamper-Evident Audit Logs** - Hash-chained audit trail for compliance
+- **GDPR Compliance** - Right-to-erasure with cascading data deletion
+- **Patroclus Integration** - Fail-closed per-tool authorization
+- **Kubernetes Ready** - Helm chart, HPA, liveness/readiness probes
 
 ## Architecture
 
@@ -504,49 +510,87 @@ MCP_GATEWAY_BACKEND__TOOL_TIMEOUT_SECONDS=120
 
 ### Docker
 
-```dockerfile
-FROM python:3.11-slim
+```bash
+docker build -t relay .
 
-WORKDIR /app
-COPY . .
-RUN pip install -e .
+# Generate required secrets
+ENCRYPTION_KEY=$(python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())")
+JWT_SECRET=$(openssl rand -hex 32)
 
-EXPOSE 8000
-
-CMD ["mcp-gateway", "serve", "--host", "0.0.0.0", "--port", "8000"]
+docker run -p 8000:8000 \
+  -e RELAY_ENVIRONMENT=production \
+  -e RELAY_ENCRYPTION_KEY=$ENCRYPTION_KEY \
+  -e RELAY_OAUTH__JWT_SECRET_KEY=$JWT_SECRET \
+  -e RELAY_SECURITY__CSRF_SECRET_KEY=$(openssl rand -hex 32) \
+  relay
 ```
 
+### Docker Compose (with Redis)
+
 ```bash
-docker build -t mcp-gateway .
-docker run -p 8000:8000 \
-  -e MCP_GATEWAY_OAUTH__JWT_SECRET_KEY=your-secret-key \
-  -e MCP_GATEWAY_ENVIRONMENT=production \
-  mcp-gateway
+# Generate secrets
+echo "JWT_SECRET_KEY=$(openssl rand -hex 32)" > .env
+echo "RELAY_ENCRYPTION_KEY=$(python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')" >> .env
+
+docker compose up -d
 ```
 
 ### Kubernetes
 
-See `deploy/kubernetes/` for Helm charts and deployment manifests.
+Helm chart available at `deploy/kubernetes/relay/`:
+
+```bash
+helm install relay deploy/kubernetes/relay/ \
+  --set secrets.relayEncryptionKey=$ENCRYPTION_KEY \
+  --set secrets.relayOauthJwtSecretKey=$JWT_SECRET \
+  --set ingress.hosts[0].host=relay.example.com
+```
+
+Features:
+- Horizontal Pod Autoscaler (2-10 replicas)
+- Liveness (`/live`) and readiness (`/ready`) probes
+- TLS ingress with cert-manager
+- Redis sidecar for distributed rate limiting
+- Non-root container, resource limits
+
+### Observability
+
+| Feature | Endpoint | Description |
+|---------|----------|-------------|
+| Prometheus metrics | `/metrics` | Request count, latency, tool calls, circuit breaker state |
+| Liveness probe | `/live` | Process is running |
+| Readiness probe | `/ready` | All backends connected |
+| Health check | `/health` | Combined health with backend status |
+| Structured logs | stdout | JSON format for ELK/Datadog/CloudWatch |
+| OpenTelemetry | OTLP | Distributed tracing (optional, `relay[otel]`) |
 
 ### Security Checklist
 
 For production deployment:
 
-- [ ] Set strong `OAUTH_JWT_SECRET_KEY` (use `openssl rand -hex 32`)
-- [ ] Enable TLS/SSL (`SERVER__SSL_ENABLED=true`)
-- [ ] Configure `IP_WHITELIST` if needed
+- [ ] Set `RELAY_ENVIRONMENT=production`
+- [ ] Set strong `RELAY_ENCRYPTION_KEY` (Fernet key)
+- [ ] Set strong `RELAY_OAUTH__JWT_SECRET_KEY` (`openssl rand -hex 32`)
+- [ ] Set `RELAY_OAUTH__JWT_ALGORITHM=RS256` and provide `RELAY_OAUTH__JWT_PUBLIC_KEY`
+- [ ] Set `RELAY_SECURITY__CSRF_SECRET_KEY`
+- [ ] Enable TLS (configure reverse proxy with Let's Encrypt)
+- [ ] Configure Redis for distributed rate limiting
+- [ ] Configure PostgreSQL for multi-instance persistence
 - [ ] Set up audit log aggregation
-- [ ] Configure rate limits appropriately
-- [ ] Use Redis for distributed rate limiting
-- [ ] Set up health checks and monitoring
+- [ ] Configure Prometheus scraping of `/metrics`
+- [ ] Set up OpenTelemetry tracing (optional)
+- [ ] Configure IP allowlists if needed
+- [ ] Set up health checks (`/live`, `/ready`)
 - [ ] Rotate credentials regularly
+- [ ] Enable Patroclus integration for per-tool authorization
+- [ ] Configure SSO/OIDC if using enterprise identity provider
 
 ## Development
 
 ### Running Tests
 
 ```bash
-pytest tests/ -v
+pytest tests/ -v --cov
 ```
 
 ### Code Style
@@ -554,7 +598,7 @@ pytest tests/ -v
 ```bash
 black .
 ruff check .
-mypy .
+mypy --ignore-missing-imports gateway/ auth/ security/ config/
 ```
 
 ## Ecosystem

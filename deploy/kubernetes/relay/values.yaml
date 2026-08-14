@@ -1,0 +1,95 @@
+replicaCount: 2
+
+image:
+  repository: relay
+  tag: latest
+  pullPolicy: IfNotPresent
+
+server:
+  host: "0.0.0.0"
+  port: 8000
+  workers: 1
+
+environment: production
+
+env:
+  RELAY_ENVIRONMENT: production
+  RELAY_OAUTH__JWT_ALGORITHM: RS256
+  RELAY_SECURITY__AUDIT_ENABLED: "true"
+  RELAY_SECURITY__CSRF_ENABLED: "true"
+  RELAY_SERVER__LOG_FORMAT: json
+
+# Secrets — provide via external secrets manager or --set
+secrets:
+  relayEncryptionKey: ""
+  relayOauthJwtSecretKey: ""
+  relayOauthJwtPublicKey: ""
+
+# External services
+redis:
+  enabled: true
+  url: ""
+  architecture: standalone
+
+database:
+  url: ""
+
+patroclus:
+  enabled: false
+  url: "http://patroclus:8484"
+
+# Ingress
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+  hosts:
+    - host: relay.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: relay-tls
+      hosts:
+        - relay.example.com
+
+# Resources
+resources:
+  limits:
+    cpu: 1000m
+    memory: 512Mi
+  requests:
+    cpu: 250m
+    memory: 256Mi
+
+# Autoscaling
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+
+# Probes
+probes:
+  liveness:
+    path: /live
+    initialDelaySeconds: 5
+    periodSeconds: 10
+  readiness:
+    path: /ready
+    initialDelaySeconds: 10
+    periodSeconds: 10
+
+# Pod security
+podSecurityContext:
+  fsGroup: 1000
+  runAsNonRoot: true
+  runAsUser: 1000
+
+# Persistence for SQLite (if not using external DB)
+persistence:
+  enabled: false
+  size: 1Gi
+  storageClass: ""

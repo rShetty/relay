@@ -58,7 +58,11 @@ from security.middleware import (
     InputValidator, 
     AuditLogger,
     IPRestrictions,
+    HSTSMiddleware,
+    SecurityHeadersMiddleware,
+    MetricsMiddleware,
 )
+from security.csrf import CSRFMiddleware
 from backends.manager import (
     BackendManager, 
     BackendDefinition, 
@@ -177,6 +181,11 @@ def _create_app_state_sync(config: RelayConfig) -> AppState:
             blacklist=config.security.ip_blacklist,
         ),
     )
+
+    # Configure Redis for distributed rate limiting (if available)
+    if config.database.redis_url:
+        security.rate_limiter.configure_redis(config.database.redis_url)
+        oauth.jwt.configure_redis(config.database.redis_url)
     
     # Initialize backend manager
     backends = BackendManager(
@@ -273,7 +282,28 @@ async def lifespan(app: FastAPI):
     
     # Startup
     config = get_config()
-    
+
+    # Initialize structured logging
+    from observability.logging import setup_logging
+    setup_logging(
+        level=config.server.log_level,
+        json_format=config.server.log_format == "json",
+        service_name=config.server.server_name,
+        service_version=config.server.server_version,
+    )
+
+    # Initialize OpenTelemetry tracing (optional)
+    if config.server.enable_tracing:
+        from observability.tracing import setup_tracing, instrument_httpx
+        setup_tracing(
+            service_name=config.server.server_name,
+            service_version=config.server.server_version,
+            otlp_endpoint=config.server.otlp_endpoint,
+        )
+        instrument_httpx()
+
+    logger.info("Starting Relay gateway (environment=%s)", config.environment)
+
     # Security: validate JWT secret is not the default
     default_secret_length = len(secrets.token_urlsafe(32))
     if len(config.oauth.jwt_secret_key) == default_secret_length:
@@ -318,6 +348,11 @@ async def lifespan(app: FastAPI):
             blacklist=config.security.ip_blacklist,
         ),
     )
+
+    # Configure Redis for distributed rate limiting (if available)
+    if config.database.redis_url:
+        security.rate_limiter.configure_redis(config.database.redis_url)
+        oauth.jwt.configure_redis(config.database.redis_url)
     
     # Initialize backend manager
     backends = BackendManager(
@@ -518,9 +553,18 @@ app.add_middleware(
 # Request ID tracing — registered after CORS so it wraps the full stack
 app.add_middleware(RequestIDMiddleware)
 
+# Security headers (CSP, X-Frame-Options, X-Content-Type-Options, etc.)
+app.add_middleware(SecurityHeadersMiddleware, enable_csp=True)
+
 # HSTS for production security
-from security.middleware import HSTSMiddleware
 app.add_middleware(HSTSMiddleware)
+
+# Prometheus metrics collection
+app.add_middleware(MetricsMiddleware)
+
+# CSRF protection for web UI forms (API endpoints are exempt)
+if _startup_config.security.csrf_enabled:
+    app.add_middleware(CSRFMiddleware, secret_key=_startup_config.security.csrf_secret_key)
 
 
 # Normalize all error responses to {"error": "..."} so clients never see
@@ -641,12 +685,15 @@ async def authorize_page(
     code_challenge: str,
     code_challenge_method: str = "S256",
     scope: str = "mcp:tools",
-    oauth_state: Optional[str] = None,  # renamed — avoids shadowing the global AppState
+    oauth_state: Optional[str] = None,
+    request: Request = None,
 ):
     """
-    OAuth authorization endpoint - shows consent page.
+    OAuth authorization endpoint.
 
-    For POC, auto-approves. In production, show UI for user consent.
+    Requires an authenticated user session. The user must be logged in
+    to authorize an OAuth client. In development with no users registered,
+    a demo user fallback can be enabled via RELAY_ENABLE_DEMO_USER=true.
     """
     app_state = _get_state()
 
@@ -658,14 +705,23 @@ async def authorize_page(
     if not app_state.oauth.validate_redirect_uri(client_id, redirect_uri):
         raise HTTPException(status_code=400, detail="Invalid redirect_uri")
 
-    # For POC: auto-approve and redirect
-    # In production: render consent page, get user approval
+    # Require authenticated user session
+    user = get_user_from_session(request) if request else None
+    if not user:
+        # Redirect to login with return URL
+        login_url = f"/auth/login?next=/oauth/authorize?client_id={client_id}&redirect_uri={redirect_uri}&code_challenge={code_challenge}&scope={scope}"
+        if oauth_state:
+            login_url += f"&oauth_state={oauth_state}"
+        return RedirectResponse(url=login_url)
+
+    # Create authorization code bound to the authenticated user
     code = app_state.oauth.create_authorization_code(
         client_id=client_id,
         redirect_uri=redirect_uri,
         code_challenge=code_challenge,
         code_challenge_method=code_challenge_method,
         scope=scope,
+        user_id=user["id"],
     )
 
     # Log the authorization
@@ -673,7 +729,7 @@ async def authorize_page(
         app_state.security.audit.log(
             event_type="oauth_authorize",
             client_id=client_id,
-            user_id="demo_user",
+            user_id=user["id"],
             ip_address="unknown",
             resource="oauth",
             action="authorize",
@@ -681,8 +737,6 @@ async def authorize_page(
             details={"scope": scope},
         )
 
-    # For POC: return JSON with redirect info
-    # In production: return HTMLResponse with consent page or redirect
     redirect_url = f"{redirect_uri}?code={code}"
     if oauth_state:
         redirect_url += f"&state={oauth_state}"
@@ -691,7 +745,6 @@ async def authorize_page(
         "code": code,
         "redirect_uri": redirect_uri,
         "state": oauth_state,
-        "message": "Authorization granted (auto-approved for POC)",
     }
 
 
@@ -888,23 +941,73 @@ async def register_user(req: UserRegisterRequest):
 
 
 @app.post("/auth/login", tags=["Auth"])
-async def login_user(req: UserLoginRequest, response: Response):
+async def login_user(req: UserLoginRequest, response: Response, request: Request):
     """Login and set session cookie."""
     from auth import database as db
     from fastapi.responses import JSONResponse
-    
+    import time as _time
+
+    app_state = _get_state()
+    ip = await get_client_ip(request)
+
+    # Account lockout check
+    lockout_key = f"login_attempts:{req.username}"
+    if not hasattr(app_state, '_login_attempts'):
+        app_state._login_attempts = {}
+    attempts = app_state._login_attempts.get(lockout_key, [])
+    now = _time.time()
+    # Clean old attempts (outside lockout window)
+    attempts = [t for t in attempts if now - t < app_state.config.security.lockout_duration_seconds]
+    app_state._login_attempts[lockout_key] = attempts
+
+    if len(attempts) >= app_state.config.security.max_login_attempts:
+        retry_after = int(app_state.config.security.lockout_duration_seconds - (now - attempts[0]))
+        if app_state.security.audit:
+            app_state.security.audit.log(
+                event_type="account_locked",
+                client_id="n/a",
+                user_id=req.username,
+                ip_address=ip,
+                resource="auth",
+                action="login",
+                success=False,
+                details={"reason": "too_many_attempts", "retry_after": retry_after},
+            )
+        raise HTTPException(
+            status_code=429,
+            detail=f"Account temporarily locked. Retry in {retry_after}s.",
+        )
+
     user_data = db.get_user_by_username(req.username)
     if not user_data:
+        attempts.append(now)
+        app_state._login_attempts[lockout_key] = attempts
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    
+
     if not user_data.get("is_active"):
         raise HTTPException(status_code=403, detail="Account is deactivated")
-    
+
     if not verify_password(req.password, user_data["hashed_password"]):
+        attempts.append(now)
+        app_state._login_attempts[lockout_key] = attempts
+        if app_state.security.audit:
+            app_state.security.audit.log(
+                event_type="login_failed",
+                client_id="n/a",
+                user_id=user_data["id"],
+                ip_address=ip,
+                resource="auth",
+                action="login",
+                success=False,
+                details={"reason": "invalid_password"},
+            )
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    
+
+    # Clear attempts on successful login
+    app_state._login_attempts.pop(lockout_key, None)
+
     session_token = create_session_token(user_data["id"])
-    
+
     # Get or create API key for user
     from auth.database import list_api_keys, create_api_key
     api_keys = list_api_keys(user_data["id"])
@@ -912,7 +1015,8 @@ async def login_user(req: UserLoginRequest, response: Response):
         api_key = create_api_key(user_data["id"], "Default")
     else:
         api_key = api_keys[0]["key"]
-    
+
+    is_prod = app_state.config.is_production
     resp = JSONResponse(content={
         "user_id": user_data["id"],
         "username": user_data["username"],
@@ -922,8 +1026,8 @@ async def login_user(req: UserLoginRequest, response: Response):
         key="session",
         value=session_token,
         httponly=True,
-        secure=False,
-        samesite="lax",
+        secure=is_prod,
+        samesite="strict" if is_prod else "lax",
         max_age=86400,
         path="/",
     )
@@ -932,8 +1036,8 @@ async def login_user(req: UserLoginRequest, response: Response):
 
 @app.post("/auth/logout", tags=["Auth"])
 async def logout_user(response: Response):
-    """Logout and clear session cookie, then redirect to login."""
-    resp = RedirectResponse(url="/auth/login", status_code=302)
+    """Logout and clear session cookie."""
+    resp = JSONResponse(content={"logged_out": True})
     resp.delete_cookie(key="session", path="/")
     return resp
 
@@ -985,6 +1089,27 @@ async def update_me(
         "username": updated["username"],
         "email": updated.get("email"),
     }
+
+
+@app.delete("/auth/me", tags=["Auth"])
+async def delete_me(
+    req: UserLoginRequest,
+    user: Dict = Depends(get_current_session_user),
+):
+    """Delete current user account permanently (GDPR right-to-erasure)."""
+    from auth import database as db
+
+    user_data = db.get_user_by_id(user["id"])
+    if not user_data or not verify_password(req.password, user_data.get("hashed_password", "")):
+        raise HTTPException(status_code=401, detail="Password confirmation required")
+
+    success = db.delete_user(user["id"])
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to delete account")
+
+    resp = JSONResponse(content={"deleted": True, "user_id": user["id"]})
+    resp.delete_cookie(key="session", path="/")
+    return resp
 
 
 # -----------------------------------------------------------------------------
@@ -1782,7 +1907,7 @@ async def api_info():
 
 @app.get("/health", tags=["Info"])
 async def health():
-    """Health check endpoint."""
+    """Health check endpoint (liveness)."""
     app_state = _get_state()
     backends_info = app_state.backends.list_backends()
     backends_healthy = sum(1 for b in backends_info if b["status"] == "healthy")
@@ -1801,6 +1926,73 @@ async def health():
             "circuit_open": circuit_open,
         },
     }
+
+
+@app.get("/live", tags=["Info"])
+async def liveness():
+    """Liveness probe — process is running."""
+    return {"status": "alive"}
+
+
+@app.get("/ready", tags=["Info"])
+async def readiness():
+    """Readiness probe — all backends connected and healthy."""
+    app_state = _get_state()
+    backends_info = app_state.backends.list_backends()
+    backends_healthy = sum(1 for b in backends_info if b["status"] == "healthy")
+    backends_total = len(backends_info)
+    circuit_open = sum(
+        1 for b in backends_info
+        if b.get("circuit_breaker", {}).get("state") == "open"
+    )
+
+    ready = backends_total == 0 or (backends_healthy > 0 and circuit_open == 0)
+    return JSONResponse(
+        status_code=200 if ready else 503,
+        content={
+            "ready": ready,
+            "backends": {
+                "healthy": backends_healthy,
+                "total": backends_total,
+                "circuit_open": circuit_open,
+            },
+        },
+    )
+
+
+@app.get("/metrics", tags=["Info"])
+async def prometheus_metrics():
+    """Prometheus metrics endpoint."""
+    from observability.metrics import metrics as metrics_exporter
+    content_type, body = metrics_exporter.render()
+    return Response(content=body, media_type=content_type)
+
+
+@app.get("/oauth/jwks", tags=["OAuth"])
+async def jwks_endpoint():
+    """
+    JWKS (JSON Web Key Set) endpoint for asymmetric JWT verification.
+
+    When using RS256, clients can fetch the public key from this endpoint
+    to verify JWT signatures without sharing the secret.
+    """
+    app_state = _get_state()
+    algorithm = app_state.config.oauth.jwt_algorithm
+
+    if algorithm == "HS256":
+        return JSONResponse(
+            status_code=400,
+            content={"error": "JWKS endpoint requires RS256 or ES256 algorithm"},
+        )
+
+    public_key = app_state.config.oauth.jwt_public_key
+    if not public_key:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Public key not configured"},
+        )
+
+    return {"keys": [{"kty": "RSA", "alg": algorithm, "use": "sig", "key": public_key}]}
 
 
 @app.get("/mcp/backends", tags=["MCP Compatible"])
