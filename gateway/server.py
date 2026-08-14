@@ -3570,7 +3570,6 @@ async def tool_fn({params_str}) -> str:
         success, result = await state.backends.call_tool(
             tool_name=tool_name,
             arguments=args,
-            backend_id=backend_id,
         )
         
         if not success:
