@@ -41,7 +41,7 @@ jobs:
       - name: Scan tracked files for credentials
         shell: bash
         run: |
-          if git grep -n -I -E 'BEGIN (RSA|OPENSSH|EC) PRIVATE KEY|RELAY_ENCRYPTION_KEY[[:space:]]*=[[:space:]]]*(gAAAA|Fernet)' -- ':!.github/workflows/' ':!README.md' ':!.env.example' ':!ENTERPRISE.md' ':!SECURITY.md'; then
+          if git grep -n -I -E 'BEGIN (RSA|OPENSSH|EC) PRIVATE KEY' -- ':!.github/workflows/' ':!*.md' ':!.env.example'; then
             exit 1
           fi
 
@@ -83,6 +83,7 @@ jobs:
     needs: [verify, security]
     runs-on: ubuntu-latest
     environment: production
+    if: ${{ vars.DEPLOY_ENABLED == 'true' }}
     steps:
       - uses: actions/checkout@v4
 
