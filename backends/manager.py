@@ -1019,68 +1019,6 @@ class BackendManager:
             return success, result
         finally:
             await connector.close()
-        """
-        Call a tool on an API backend by delegating to the connector's
-        tool-specific handler.  This avoids the old stub that blindly
-        POSTed to /{tool_name}.
-        """
-        from connectors import get_registry, ConnectorConfig
-
-        cred = user_token if user_token else os.getenv(definition.env_key, "")
-        if not cred:
-            return False, (
-                f"No credentials for '{definition.id}'. "
-                f"Set {definition.env_key} or store a token via POST /v1/tokens."
-            )
-
-        connector_name = definition.connector or definition.id
-        registry = get_registry()
-        conn_class = registry.CONNECTOR_TYPES.get(connector_name)
-        if conn_class is None:
-            return False, f"No connector class for '{connector_name}'"
-
-        config = ConnectorConfig(api_key=cred, base_url=definition.base_url)
-        connector = conn_class(config)
-        try:
-            success, result = await connector.call_tool(tool_name, arguments)
-            return success, result
-        finally:
-            await connector.close()
-
-    async def _call_graphql_tool(
-        self,
-        definition: BackendDefinition,
-        tool_name: str,
-        arguments: Dict[str, Any],
-        timeout: int,
-        user_token: Optional[str] = None,
-    ) -> Tuple[bool, Any]:
-        """
-        Call a tool on a GraphQL API backend by delegating to the connector's
-        tool-specific handler (which already knows how to build GraphQL queries).
-        """
-        from connectors import get_registry, ConnectorConfig
-
-        cred = user_token if user_token else os.getenv(definition.env_key, "")
-        if not cred:
-            return False, (
-                f"No credentials for '{definition.id}'. "
-                f"Set {definition.env_key} or store a token via POST /v1/tokens."
-            )
-
-        connector_name = definition.connector or definition.id
-        registry = get_registry()
-        conn_class = registry.CONNECTOR_TYPES.get(connector_name)
-        if conn_class is None:
-            return False, f"No connector class for '{connector_name}'"
-
-        config = ConnectorConfig(api_key=cred, base_url=definition.base_url)
-        connector = conn_class(config)
-        try:
-            success, result = await connector.call_tool(tool_name, arguments)
-            return success, result
-        finally:
-            await connector.close()
 
     # -------------------------------------------------------------------------
     # Health Monitoring
