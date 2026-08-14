@@ -14,7 +14,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Copy project metadata and source
 COPY pyproject.toml README.md ./
-COPY gateway/ auth/ backends/ config/ connectors/ security/ observability/ patroclus/ ./
+COPY gateway/ ./gateway/
+COPY auth/ ./auth/
+COPY backends/ ./backends/
+COPY config/ ./config/
+COPY connectors/ ./connectors/
+COPY security/ ./security/
+COPY observability/ ./observability/
+COPY patroclus/ ./patroclus/
 
 # Build wheels
 RUN pip install --no-cache-dir build && \
