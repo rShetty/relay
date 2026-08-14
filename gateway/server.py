@@ -71,6 +71,7 @@ from connectors import (
     get_registry,
 )
 from auth.token_store import get_token_store, set_token_store, AbstractTokenStore
+from patroclus import PatroclusClient
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +115,7 @@ class AppState:
     security: SecurityContext
     backends: BackendManager
     connectors: ConnectorRegistry
+    patroclus: Optional[PatroclusClient] = None
     started_at: datetime = None
 
     def __post_init__(self):
@@ -402,6 +404,20 @@ async def lifespan(app: FastAPI):
     token_store = create_database_token_store()
     set_token_store(token_store)
     
+    # Initialize Patroclus authorization client
+    patroclus = PatroclusClient.from_env()
+    if patroclus.enabled:
+        healthy = await patroclus.health()
+        if healthy:
+            logger.info("Patroclus authorization connected at %s", patroclus.base_url)
+        else:
+            logger.warning(
+                "Patroclus enabled but not reachable at %s — tool calls will be denied",
+                patroclus.base_url,
+            )
+    else:
+        logger.info("Patroclus authorization not enabled (set PATROCLUS_ENABLED=true)")
+    
     # Store state
     state = AppState(
         config=config,
@@ -410,6 +426,7 @@ async def lifespan(app: FastAPI):
         security=security,
         backends=backends,
         connectors=connectors,
+        patroclus=patroclus,
     )
     
     # Mount per-connector MCP servers on /mcp/{connector}
@@ -435,6 +452,8 @@ async def lifespan(app: FastAPI):
     # Shutdown
     await backends.stop()
     await connectors.close_all()
+    if state and state.patroclus:
+        await state.patroclus.close()
     logger.info("Relay stopped")
 
 
@@ -2184,6 +2203,11 @@ async def _execute_tool(
     """
     Shared tool execution logic for both v1 and mcp endpoints.
 
+    Authorization flow:
+    1. Relay's own security checks (rate limiting, input validation)
+    2. Patroclus policy check (if enabled) — deny by default
+    3. Token resolution and tool dispatch
+
     Routing decision (configurable per-service via ROUTING_CONFIG):
     - "connector" → direct API connector (httpx)
     - "backend"   → MCP server or API backend
@@ -2207,6 +2231,49 @@ async def _execute_tool(
     )
     if not valid:
         raise HTTPException(status_code=400, detail=sanitized)
+
+    # ── Patroclus authorization check ──────────────────────────────
+    if state.patroclus and state.patroclus.enabled:
+        connector_name = state.connectors._tool_index.get(tool_name) or ""
+        resource = f"{connector_name}/{tool_name}" if connector_name else tool_name
+        agent_id = user.get("user_id", "unknown")
+
+        decision, reason = await state.patroclus.check_access(
+            agent_id=agent_id,
+            action="call",
+            resource=resource,
+            requested_scopes=[f"{connector_name}:{tool_name}"] if connector_name else [],
+        )
+
+        if decision == "deny":
+            state.security.audit_logger.log(
+                event="patroclus_denied",
+                client_id=user["client_id"],
+                user_id=user["user_id"],
+                tool_name=tool_name,
+                ip_address=ip,
+                reason=reason,
+            )
+            return False, json.dumps({
+                "error": "Access denied by policy",
+                "reason": reason,
+                "hint": "Contact your administrator if you believe this is an error.",
+            })
+
+        if decision == "require_approval":
+            state.security.audit_logger.log(
+                event="patroclus_approval_required",
+                client_id=user["client_id"],
+                user_id=user["user_id"],
+                tool_name=tool_name,
+                ip_address=ip,
+                reason=reason,
+            )
+            return False, json.dumps({
+                "error": "Approval required",
+                "reason": reason,
+                "hint": "This action requires human approval. An approval request has been created.",
+            })
 
     connector_name = state.connectors._tool_index.get(tool_name)
     resolved_backend_id = backend_id or state.backends._tool_index.get(tool_name)
@@ -3023,6 +3090,25 @@ async def tool_fn({params_str}) -> str:
         except Exception:
             pass
 
+    # Patroclus authorization check
+    if app_state.patroclus and app_state.patroclus.enabled and user_id:
+        _decision, _reason = await app_state.patroclus.check_access(
+            agent_id=user_id,
+            action="call",
+            resource="{connector_name}/{{tool_name}}",
+            requested_scopes=["{connector_name}:{{tool_name}}"],
+        )
+        if _decision == "deny":
+            return json.dumps({{
+                "error": "Access denied by Patroclus policy",
+                "reason": _reason,
+            }})
+        if _decision == "require_approval":
+            return json.dumps({{
+                "error": "Approval required by Patroclus policy",
+                "reason": _reason,
+            }})
+
     requires_auth = {tool_def.requires_auth}
     if requires_auth and not user_token:
         return json.dumps({{
@@ -3446,6 +3532,101 @@ def run_mcp_server(transport: str = "stdio", port: int = None):
             mcp.run(transport=transport, mount_path="/mcp")
             # Note: FastMCP run() is blocking and manages its own server
             # For production, consider running MCP as separate process
+
+
+# -----------------------------------------------------------------------------
+# Patroclus Authorization Endpoints
+# -----------------------------------------------------------------------------
+
+@app.get("/patroclus/status", tags=["Patroclus"])
+async def patroclus_status():
+    """Check Patroclus authorization connection status."""
+    if not state or not state.patroclus:
+        return {"enabled": False, "connected": False}
+    connected = await state.patroclus.health()
+    return {
+        "enabled": state.patroclus.enabled,
+        "connected": connected,
+        "url": state.patroclus.base_url,
+    }
+
+
+@app.post("/patroclus/agents", tags=["Patroclus"])
+async def patroclus_register_agent(request: Request):
+    """Register a new agent in Patroclus."""
+    body = await request.json()
+    if not state or not state.patroclus or not state.patroclus.enabled:
+        raise HTTPException(status_code=503, detail="Patroclus not enabled")
+    result = await state.patroclus.register_agent(
+        name=body.get("name", ""),
+        principal_type=body.get("principal_type", "delegated"),
+        owner_id=body.get("owner_id"),
+        public_key=body.get("public_key"),
+    )
+    if result is None:
+        raise HTTPException(status_code=502, detail="Failed to register agent")
+    return result
+
+
+@app.post("/patroclus/policies", tags=["Patroclus"])
+async def patroclus_create_policy(request: Request):
+    """Create a new authorization policy in Patroclus."""
+    body = await request.json()
+    if not state or not state.patroclus or not state.patroclus.enabled:
+        raise HTTPException(status_code=503, detail="Patroclus not enabled")
+    success = await state.patroclus.create_policy(
+        name=body.get("name", ""),
+        definition=body.get("definition", ""),
+        engine=body.get("engine", "yaml"),
+    )
+    if not success:
+        raise HTTPException(status_code=502, detail="Failed to create policy")
+    return {"status": "created"}
+
+
+@app.post("/patroclus/delegate", tags=["Patroclus"])
+async def patroclus_delegate_permissions(request: Request):
+    """Delegate scoped permissions to an agent."""
+    body = await request.json()
+    if not state or not state.patroclus or not state.patroclus.enabled:
+        raise HTTPException(status_code=503, detail="Patroclus not enabled")
+    result = await state.patroclus.delegate_permissions(
+        agent_id=body.get("agent_id", ""),
+        scopes=body.get("scopes", []),
+        expires_in_seconds=body.get("expires_in_seconds", 900),
+        constraints=body.get("constraints"),
+    )
+    if result is None:
+        raise HTTPException(status_code=502, detail="Failed to delegate permissions")
+    return result
+
+
+@app.get("/patroclus/approvals", tags=["Patroclus"])
+async def patroclus_list_approvals():
+    """List pending approval requests from Patroclus."""
+    if not state or not state.patroclus or not state.patroclus.enabled:
+        raise HTTPException(status_code=503, detail="Patroclus not enabled")
+    client = await state.patroclus._get_client()
+    resp = await client.get("/v1/principal/approvals")
+    if resp.status_code == 200:
+        return resp.json()
+    raise HTTPException(status_code=resp.status_code, detail=resp.text)
+
+
+@app.post("/patroclus/approvals/{request_id}/approve", tags=["Patroclus"])
+async def patroclus_approve_request(request_id: str, request: Request):
+    """Approve a pending approval request in Patroclus."""
+    body = await request.json()
+    if not state or not state.patroclus or not state.patroclus.enabled:
+        raise HTTPException(status_code=503, detail="Patroclus not enabled")
+    result = await state.patroclus.approve_request(
+        request_id=request_id,
+        approver_id=body.get("approver_id", ""),
+        reason=body.get("reason"),
+    )
+    if result is None:
+        raise HTTPException(status_code=502, detail="Failed to approve request")
+    return result
 
 
 if __name__ == "__main__":
