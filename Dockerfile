@@ -12,10 +12,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
+# Copy project metadata and source
 COPY pyproject.toml README.md ./
+COPY gateway/ auth/ backends/ config/ connectors/ security/ observability/ patroclus/ ./
+
+# Build wheels
 RUN pip install --no-cache-dir build && \
-    pip wheel --no-cache-dir --wheel-dir /wheels -e .
+    pip wheel --no-cache-dir --wheel-dir /wheels .
 
 # ---- Runtime Stage ----
 FROM python:3.11-slim
@@ -30,11 +33,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy wheels from builder
+# Copy wheels from builder and install
 COPY --from=builder /wheels /wheels
 RUN pip install --no-cache-dir /wheels/*.whl && rm -rf /wheels
 
-# Copy application code
+# Copy application code (templates, static files not in package)
 COPY --chown=relay:relay . .
 
 # Create directories
@@ -55,7 +58,7 @@ ENV RELAY_ENVIRONMENT=production \
 EXPOSE 8000
 
 # Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
     CMD curl -f http://localhost:8000/live || exit 1
 
 # Default command
