@@ -139,6 +139,10 @@ jobs:
             EOF
             chmod 600 /opt/relay/.env
 
+            # ── Ensure data and log directories are writable by UID 1000
+            mkdir -p /opt/relay/data /opt/relay/logs
+            chown -R 1000:1000 /opt/relay/data /opt/relay/logs
+
             # ── Rebuild and restart Docker containers ────────────────
             cd /opt/relay
             docker compose -f docker-compose.prod.yml down

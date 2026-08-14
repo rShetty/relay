@@ -32,8 +32,8 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Create non-root user
-RUN groupadd -r relay && useradd -r -g relay relay
+# Create non-root user with fixed UID/GID for volume permissions
+RUN groupadd -r -g 1000 relay && useradd -r -g relay -u 1000 relay
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -47,7 +47,7 @@ RUN pip install --no-cache-dir /wheels/*.whl && rm -rf /wheels
 # Copy application code (templates, static files not in package)
 COPY --chown=relay:relay . .
 
-# Create directories
+# Create directories with correct ownership
 RUN mkdir -p logs data && chown -R relay:relay logs data
 
 # Switch to non-root user
