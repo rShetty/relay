@@ -8,7 +8,7 @@ that uses SQLite for persistent storage.
 import secrets
 import logging
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from auth.oauth import OAuthProvider, AuthorizationCode, ClientRegistration, User, TokenPair
 from auth import database as db
 
@@ -344,7 +344,3 @@ class DatabaseTokenStore:
     async def list_connectors_for_user(self, user_id: str) -> List[str]:
         """List all connectors with tokens for a user."""
         return db.list_user_connectors(user_id)
-
-
-# Need to import List for type hints
-from typing import List
