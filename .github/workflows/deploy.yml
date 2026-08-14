@@ -83,7 +83,6 @@ jobs:
     needs: [verify, security]
     runs-on: ubuntu-latest
     environment: production
-    if: ${{ vars.DEPLOY_ENABLED == 'true' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -101,13 +100,11 @@ jobs:
 
             # ── Secrets from GitHub ──────────────────────────────────
             RELAY_ENCRYPTION_KEY="${{ secrets.RELAY_ENCRYPTION_KEY }}"
-            RELAY_OAUTH__JWT_SECRET_KEY="${{ secrets.RELAY_JWT_SECRET_KEY }}"
-            RELAY_SECURITY__CSRF_SECRET_KEY="${{ secrets.RELAY_CSRF_SECRET_KEY }}"
+            RELAY_JWT_SECRET_KEY="${{ secrets.RELAY_JWT_SECRET_KEY }}"
+            RELAY_CSRF_SECRET_KEY="${{ secrets.RELAY_CSRF_SECRET_KEY }}"
             GITHUB_PAT="${{ secrets.GITHUB_PAT }}"
             OPENAI_API_KEY="${{ secrets.OPENAI_API_KEY }}"
             SLACK_BOT_TOKEN="${{ secrets.SLACK_BOT_TOKEN }}"
-            PATROCLUS_ENABLED="${{ secrets.PATROCLUS_ENABLED || 'false' }}"
-            PATROCLUS_URL="${{ secrets.PATROCLUS_URL || 'http://localhost:8484' }}"
 
             # ── Clone or update repo ─────────────────────────────────
             if [ ! -d /opt/relay/.git ]; then
@@ -121,79 +118,36 @@ jobs:
             git clean -fd
 
             # ── Write environment file ───────────────────────────────
-            mkdir -p /etc/relay
-            if [ -f /etc/relay/relay.env ]; then
-              cp /etc/relay/relay.env /etc/relay/relay.env.bak
-            else
-              : > /etc/relay/relay.env
-            fi
-
-            cat > /etc/relay/relay.env << EOF
+            # Preserve existing DB and data, update secrets
+            cat > /opt/relay/.env << EOF
             RELAY_ENVIRONMENT=production
             RELAY_SERVER__HOST=0.0.0.0
             RELAY_SERVER__PORT=8000
             RELAY_SERVER__LOG_FORMAT=json
             RELAY_SERVER__LOG_LEVEL=INFO
             RELAY_ENCRYPTION_KEY=${RELAY_ENCRYPTION_KEY}
-            RELAY_OAUTH__JWT_SECRET_KEY=${RELAY_OAUTH__JWT_SECRET_KEY}
-            RELAY_OAUTH__JWT_ALGORITHM=HS256
+            RELAY_OAUTH__JWT_SECRET_KEY=${RELAY_JWT_SECRET_KEY}
             RELAY_SECURITY__CSRF_ENABLED=true
-            RELAY_SECURITY__CSRF_SECRET_KEY=${RELAY_SECURITY__CSRF_SECRET_KEY}
+            RELAY_SECURITY__CSRF_SECRET_KEY=${RELAY_CSRF_SECRET_KEY}
             RELAY_SECURITY__AUDIT_ENABLED=true
-            RELAY_SECURITY__AUDIT_LOG_PATH=/var/lib/relay/logs/audit.log
-            RELAY_DATABASE__SQLITE_PATH=/var/lib/relay/data/gateway.db
-            RELAY_DATABASE__REDIS_URL=redis://127.0.0.1:6379/0
+            RELAY_SECURITY__AUDIT_LOG_PATH=logs/audit.log
+            RELAY_DATABASE__SQLITE_PATH=data/gateway.db
+            RELAY_DATABASE__REDIS_URL=redis://relay-redis:6379/0
             GITHUB_PERSONAL_ACCESS_TOKEN=${GITHUB_PAT}
             OPENAI_API_KEY=${OPENAI_API_KEY}
             SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN}
-            PATROCLUS_ENABLED=${PATROCLUS_ENABLED}
-            PATROCLUS_URL=${PATROCLUS_URL}
             EOF
-            chmod 600 /etc/relay/relay.env
+            chmod 600 /opt/relay/.env
 
-            # ── Create relay user ────────────────────────────────────
-            id relay >/dev/null 2>&1 || useradd --system --home-dir /var/lib/relay --create-home --shell /usr/sbin/nologin relay
-
-            # ── Create data and log directories ──────────────────────
-            mkdir -p /var/lib/relay/data /var/lib/relay/logs
-            chown -R relay:relay /var/lib/relay
-
-            # ── Install Python + dependencies ────────────────────────
-            export HOME=/root
-            if ! command -v python3.11 &>/dev/null; then
-              add-apt-repository -y ppa:deadsnakes/ppa
-              apt-get update
-              apt-get install -y python3.11 python3.11-venv python3.11-dev
-            fi
-
+            # ── Rebuild and restart Docker containers ────────────────
             cd /opt/relay
-            python3.11 -m venv /opt/relay/.venv
-            source /opt/relay/.venv/bin/activate
-            pip install --upgrade pip
-            pip install -e ".[dev]"
-
-            # ── Initialize database ──────────────────────────────────
-            export $(grep -v '^#' /etc/relay/relay.env | xargs)
-            python -c "from auth.database import init_db; init_db()"
-
-            # ── Ensure Redis is running ──────────────────────────────
-            if ! command -v redis-server &>/dev/null; then
-              apt-get install -y redis-server
-              systemctl enable redis-server
-              systemctl start redis-server
-            fi
-
-            # ── Install systemd unit ─────────────────────────────────
-            cp /opt/relay/deploy/relay.service /etc/systemd/system/relay.service
-            systemctl daemon-reload
-            systemctl enable relay
-
-            # ── Restart service ──────────────────────────────────────
-            systemctl restart relay
+            docker compose -f docker-compose.prod.yml down
+            docker compose -f docker-compose.prod.yml build --no-cache
+            docker compose -f docker-compose.prod.yml up -d
 
             # ── Health check with retries ────────────────────────────
-            sleep 5
-            for i in 1 2 3 4 5; do
+            sleep 10
+            for i in 1 2 3 4 5 6; do
               if curl -sf http://127.0.0.1:8000/live; then
                 echo ""
                 echo "DEPLOY SUCCESS: relay is healthy"
@@ -204,7 +158,7 @@ jobs:
             done
 
             echo "ERROR: Health check failed"
-            journalctl -u relay -n 30 --no-pager
+            docker logs relay-app --tail 30
             exit 1
 
       - name: Retry deploy (1)
@@ -223,11 +177,11 @@ jobs:
             git fetch origin main
             git reset --hard origin/main
             git clean -fd
-            source /opt/relay/.venv/bin/activate
-            pip install -e ".[dev]"
-            systemctl restart relay
-            sleep 5
-            curl -sf http://127.0.0.1:8000/live && echo "DEPLOY SUCCESS (retry 1)" || (journalctl -u relay -n 20 --no-pager && exit 1)
+            docker compose -f docker-compose.prod.yml down
+            docker compose -f docker-compose.prod.yml build --no-cache
+            docker compose -f docker-compose.prod.yml up -d
+            sleep 10
+            curl -sf http://127.0.0.1:8000/live && echo "DEPLOY SUCCESS (retry 1)" || (docker logs relay-app --tail 20 && exit 1)
 
       - name: Retry deploy (2)
         if: failure()
@@ -241,6 +195,7 @@ jobs:
           command_timeout: 30m
           script: |
             set -euo pipefail
-            systemctl restart relay
-            sleep 5
-            curl -sf http://127.0.0.1:8000/live && echo "DEPLOY SUCCESS (retry 2)" || (journalctl -u relay -n 20 --no-pager && exit 1)
+            cd /opt/relay
+            docker compose -f docker-compose.prod.yml restart
+            sleep 10
+            curl -sf http://127.0.0.1:8000/live && echo "DEPLOY SUCCESS (retry 2)" || (docker logs relay-app --tail 20 && exit 1)
