@@ -3549,8 +3549,8 @@ async def tool_fn({params_str}) -> str:
         return state.backends.list_tools()
     
     mcp = FastMCP(
-        f"relay-{backend_id}",
-        instructions=f"Relay proxying to {backend_id} backend",
+        f"relay-{connector_name}",
+        instructions=f"Relay proxying to {connector_name} connector",
     )
 
     @mcp.tool()
