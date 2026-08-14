@@ -39,6 +39,10 @@ class CSRFMiddleware(BaseHTTPMiddleware):
         "/health",
         "/ready",
         "/live",
+        "/auth/login",
+        "/auth/register",
+        "/auth/me",
+        "/auth/logout",
     )
 
     def __init__(self, app, secret_key: str, cookie_name: str = "csrf_token"):
