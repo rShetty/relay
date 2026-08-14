@@ -504,14 +504,18 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Static files
+# Static files — check package-relative, then CWD (for Docker/installed deployments)
 import os
 _static_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static")
+if not os.path.isdir(_static_dir):
+    _static_dir = os.path.join(os.getcwd(), "static")
 if os.path.isdir(_static_dir):
     app.mount("/static", StaticFiles(directory=_static_dir), name="static")
 
-# Jinja2 templates
+# Jinja2 templates — same fallback logic
 _template_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "templates")
+if not os.path.isdir(_template_dir):
+    _template_dir = os.path.join(os.getcwd(), "templates")
 if os.path.isdir(_template_dir):
     templates = Environment(
         loader=FileSystemLoader(_template_dir),
