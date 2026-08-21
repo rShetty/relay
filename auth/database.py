@@ -965,7 +965,9 @@ def set_connector_permission(
         # Convert to sets for union operation, then back to list
         merged_tools = list(set(existing_tools) | set(tools))
     
-    tools_json = json.dumps(merged_tools) if merged_tools else None
+    tools_json = json.dumps(merged_tools) if merged_tools is not None else "null"
+    # NOTE: the column is NOT NULL, so "all tools" is stored as the JSON text
+    # 'null' (readers json.loads() it back to None); [] stays a real empty list.
     
     conn.execute("""
         INSERT OR REPLACE INTO connector_permissions 

@@ -1780,6 +1780,20 @@ async def install_backend(req: BackendInstallRequest, current_user: Dict = Depen
     if req.backend_type in ["api_rest", "api_graphql"] and "base_url" not in req.config:
         raise HTTPException(status_code=400, detail=f"{req.backend_type} backends require 'base_url' in config")
     
+    # SSRF validation (issue #4): remote backend URLs must not target
+    # private/link-local/metadata addresses or non-https schemes.
+    from security.ssrf import validate_backend_url
+    for url_field in ("url", "base_url"):
+        url_value = req.config.get(url_field)
+        if url_value is None:
+            continue
+        url_ok, url_reason = validate_backend_url(str(url_value))
+        if not url_ok:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Backend URL rejected by SSRF policy: {url_reason}",
+            )
+    
     # Save to database
     save_installed_backend(
         backend_id=req.backend_id,
