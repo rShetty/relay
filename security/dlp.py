@@ -21,9 +21,20 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+#: Supported enforcement modes.
+#:
+#: - ``redact``: scrub credential-shaped content and return the sanitized
+#:   result to the caller (fail-open for availability).
+#: - ``block``: never deliver a result that tripped a detector; the caller
+#:   receives an error instead (fail-closed).
+DLP_MODES = ("redact", "block")
+
+#: Maximum number of violation previews attached to a single audit event.
+MAX_VIOLATIONS_PER_EVENT = 10
 
 
 class ResultDLPInspector:
@@ -63,8 +74,15 @@ class ResultDLPInspector:
 
     MAX_DEPTH = 10
 
-    def __init__(self, enabled: bool = True):
+    def __init__(
+        self,
+        enabled: bool = True,
+        mode: str = "redact",
+    ):
         self.enabled = enabled
+        if mode not in DLP_MODES:
+            raise ValueError(f"Unknown result-DLP mode: {mode!r} (expected one of {DLP_MODES})")
+        self.mode = mode
         self._sensitive_key_re = re.compile(
             "|".join(self.SENSITIVE_KEY_PATTERNS),
             re.IGNORECASE,
@@ -85,6 +103,38 @@ class ResultDLPInspector:
         if not self.enabled or result is None:
             return result
         return self._inspect(result, depth=0)
+
+    def scan_result(self, result: Any) -> List[Tuple[str, str]]:
+        """
+        Detect violations without mutating anything.
+
+        Returns a list of ``(violation_kind, preview)`` tuples.  The preview
+        is already redacted (matched content replaced with ``[REDACTED]``)
+        so it is safe for audit logs.
+        """
+        findings: List[Tuple[str, str]] = []
+        if not self.enabled or result is None:
+            return findings
+        self._scan(result, depth=0, key=None, findings=findings)
+        return findings
+
+    def enforce(self, result: Any) -> Tuple[Any, List[Tuple[str, str]]]:
+        """
+        Enforce this inspector's mode against *result*.
+
+        Returns ``(output, violations)`` where *violations* is the list
+        produced by :meth:`scan_result`:
+
+        - ``redact`` mode → output is the sanitized copy of the result.
+        - ``block`` mode  → output is ``None`` whenever any violation was
+          detected; otherwise it is the original result.
+        """
+        violations = self.scan_result(result)
+        if not violations:
+            return result, []
+        if self.mode == "block":
+            return None, violations
+        return self.inspect_result(result), violations
 
     # ------------------------------------------------------------------
     # Internal recursion
@@ -121,6 +171,62 @@ class ResultDLPInspector:
             text = pattern.sub(self.REDACTED, text)
         return text
 
+    # ------------------------------------------------------------------
+    # Violation detection (non-mutating)
+    # ------------------------------------------------------------------
+
+    def _scan(
+        self,
+        value: Any,
+        depth: int,
+        key: Optional[str],
+        findings: List[Tuple[str, str]],
+    ) -> None:
+        """Collect ``(kind, redacted_preview)`` findings without mutating."""
+        if depth > self.MAX_DEPTH or len(findings) >= MAX_VIOLATIONS_PER_EVENT:
+            return
+
+        if isinstance(value, dict):
+            for k, v in value.items():
+                k_str = str(k)
+                if self._sensitive_key_re.search(k_str):
+                    findings.append(("sensitive_key", f'"{k_str}": "{self.REDACTED}"'))
+                else:
+                    self._scan(v, depth + 1, key=k_str, findings=findings)
+            return
+
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                self._scan(item, depth + 1, key=key, findings=findings)
+            return
+
+        if isinstance(value, str):
+            if key is not None and self._sensitive_key_re.search(key):
+                findings.append(("sensitive_key", f'"{key}": "{self.REDACTED}"'))
+                return
+            matched = [
+                name for name, pattern in self._value_patterns
+                if pattern.search(value)
+            ]
+            if matched:
+                preview = self._redact_content(value)
+                if len(preview) > 200:
+                    preview = preview[:200] + "...[truncated]"
+                findings.append(("value_pattern:" + ",".join(matched), preview))
+
+    @staticmethod
+    def format_violations(violations: List[Tuple[str, str]]) -> List[Dict[str, str]]:
+        """
+        Convert scan findings into JSON-serializable audit details.
+
+        Previews are already redacted by :meth:`scan_result`, so they never
+        contain the secret itself.
+        """
+        return [
+            {"type": kind, "preview": preview}
+            for kind, preview in violations[:MAX_VIOLATIONS_PER_EVENT]
+        ]
+
 
 _inspector: Optional[ResultDLPInspector] = None
 
@@ -149,3 +255,13 @@ def set_dlp_inspector(inspector: Optional[ResultDLPInspector]) -> None:
 def inspect_tool_result(result: Any) -> Any:
     """Convenience hook: run the active DLP inspector over a tool result."""
     return get_dlp_inspector().inspect_result(result)
+
+
+def enforce_tool_result(result: Any) -> Tuple[Any, List[Tuple[str, str]]]:
+    """
+    Convenience hook: enforce the active inspector's mode on a tool result.
+
+    Returns ``(output, violations)`` — see
+    :meth:`ResultDLPInspector.enforce` for semantics.
+    """
+    return get_dlp_inspector().enforce(result)

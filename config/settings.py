@@ -134,7 +134,18 @@ class SecuritySettings(BaseSettings):
     ip_blacklist: List[str] = Field(default_factory=list)
 
     # Result DLP (credential-shaped content scrubbed from tool call results)
-    dlp_enabled: bool = True
+    # Env: RELAY_SECURITY__RESULT_DLP_ENABLED / RELAY_SECURITY__RESULT_DLP_MODE
+    result_dlp_enabled: bool = True
+    # "redact" = deliver sanitized results; "block" = reject violating results.
+    result_dlp_mode: str = "redact"
+
+    @field_validator("result_dlp_mode")
+    @classmethod
+    def validate_result_dlp_mode(cls, v: str) -> str:
+        allowed = {"redact", "block"}
+        if v not in allowed:
+            raise ValueError(f"result_dlp_mode must be one of {allowed}")
+        return v
 
     # CSRF protection
     csrf_enabled: bool = True

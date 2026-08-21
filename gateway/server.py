@@ -77,6 +77,58 @@ def _dlp_inspect(result: Any) -> Any:
     if inspector is None:
         inspector = get_dlp_inspector()
     return inspector.inspect_result(result)
+
+
+def _dlp_enforce(
+    result: Any,
+    tool_name: str,
+    user: Optional[Dict[str, Any]] = None,
+    ip: Optional[str] = None,
+) -> Any:
+    """
+    Run result-DLP enforcement for a tool result.
+
+    Uses the state-configured inspector when available, falling back to the
+    process-wide default.  Violations are written to the audit log with a
+    redacted preview (never the secret itself).
+
+    Returns the (possibly sanitized) result, or ``None`` when the inspector
+    runs in ``block`` mode and the result tripped a detector — callers must
+    treat ``None`` as "do not deliver this result".
+    """
+    app_state = globals().get("state")
+    inspector = None
+    if app_state is not None:
+        inspector = getattr(app_state.security, "dlp_inspector", None)
+    if inspector is None:
+        inspector = get_dlp_inspector()
+
+    if not inspector.enabled:
+        return result
+
+    output, violations = inspector.enforce(result)
+    if violations:
+        user = user or {}
+        details = {
+            "tool": tool_name,
+            "mode": inspector.mode,
+            "violations": ResultDLPInspector.format_violations(violations),
+        }
+        audit = getattr(getattr(app_state, "security", None), "audit", None)
+        if audit is not None:
+            audit.log(
+                event_type="dlp_result_violation",
+                client_id=str(user.get("client_id", "unknown"))[:64],
+                user_id=user.get("user_id"),
+                ip_address=ip or "unknown",
+                resource=tool_name,
+                action="result_dlp",
+                success=(inspector.mode != "block"),
+                details=details,
+            )
+        else:
+            logger.warning("Result DLP violation (audit log unavailable): %s", details)
+    return output
 from backends.manager import (
     BackendManager, 
     BackendDefinition, 
@@ -225,7 +277,10 @@ def _create_app_state_sync(config: RelayConfig) -> AppState:
             whitelist=config.security.ip_whitelist,
             blacklist=config.security.ip_blacklist,
         ),
-        dlp_inspector=ResultDLPInspector(enabled=config.security.dlp_enabled),
+        dlp_inspector=ResultDLPInspector(
+            enabled=config.security.result_dlp_enabled,
+            mode=config.security.result_dlp_mode,
+        ),
     )
 
     # Configure Redis for distributed rate limiting (if available)
@@ -393,7 +448,10 @@ async def lifespan(app: FastAPI):
             whitelist=config.security.ip_whitelist,
             blacklist=config.security.ip_blacklist,
         ),
-        dlp_inspector=ResultDLPInspector(enabled=config.security.dlp_enabled),
+        dlp_inspector=ResultDLPInspector(
+            enabled=config.security.result_dlp_enabled,
+            mode=config.security.result_dlp_mode,
+        ),
     )
 
     # Configure Redis for distributed rate limiting (if available)
@@ -3000,11 +3058,19 @@ async def _execute_tool(
         result_summary=str(result)[:200] if result else None,
     )
 
-    # DLP: scrub credential-shaped content from results before they reach
-    # the caller / model context. Disable by calling set_dlp_inspector(None)
-    # or installing a disabled inspector.
+    # DLP: scrub (or block) credential-shaped content before it reaches
+    # the caller / model context. Violations are audit-logged with a
+    # redacted preview. Disable by calling set_dlp_inspector(None) or
+    # installing a disabled inspector.
     if success:
-        result = _dlp_inspect(result)
+        result = _dlp_enforce(result, tool_name=tool_name, user=user, ip=ip)
+        if result is None:
+            return False, {
+                "error": "Result blocked by data loss prevention policy",
+                "reason": "dlp_result_blocked",
+                "hint": "The tool result contained credential-shaped content "
+                        "and RELAY_SECURITY__RESULT_DLP_MODE=block is configured.",
+            }
 
     return success, result
 
@@ -3522,8 +3588,15 @@ def create_mcp_server(app_state: Optional["AppState"] = None, init_state: bool =
 
         if not success:
             return json.dumps({"error": result})
-        # DLP: scrub credential-shaped content before returning to the caller.
-        return json.dumps({"result": _dlp_inspect(result)})
+        # DLP: scrub (or block) credential-shaped content before returning
+        # to the caller. Violations are audit-logged with a redacted preview.
+        enforced = _dlp_enforce(result, tool_name=tool_name, user=user_info)
+        if enforced is None:
+            return json.dumps({
+                "error": "Result blocked by data loss prevention policy",
+                "reason": "dlp_result_blocked",
+            })
+        return json.dumps({"result": enforced})
     
     # --- Gateway management tools ---
     
@@ -3776,8 +3849,15 @@ def _build_mcp_tool_handler(
         )
         if not success:
             return json.dumps({"error": result})
-        # DLP: scrub credential-shaped content before returning to the caller.
-        return json.dumps({"result": _dlp_inspect(result)})
+        # DLP: scrub (or block) credential-shaped content before returning
+        # to the caller. Violations are audit-logged with a redacted preview.
+        enforced = _dlp_enforce(result, tool_name=tool_name, user=user_info)
+        if enforced is None:
+            return json.dumps({
+                "error": "Result blocked by data loss prevention policy",
+                "reason": "dlp_result_blocked",
+            })
+        return json.dumps({"result": enforced})
 
     sig_params = []
     for pname in param_names:

@@ -27,9 +27,10 @@ from typing import Any, Callable, Dict, List, Optional, Set, TYPE_CHECKING
 
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from security.dlp import ResultDLPInspector, get_dlp_inspector
+
 if TYPE_CHECKING:
     from fastapi import Request
-    from security.dlp import ResultDLPInspector
 
 logger = logging.getLogger(__name__)
 
@@ -674,6 +675,11 @@ class SecurityContext:
     ) -> None:
         """Log a tool call for audit."""
         if self.audit:
+            # The result summary may echo backend content (including
+            # credential-shaped strings) into the audit trail, so it is
+            # scrubbed through the same redaction engine as results.
+            if result_summary:
+                result_summary = self._redact_result_preview(result_summary)
             self.audit.log(
                 event_type="tool_call",
                 client_id=client_id,
@@ -687,6 +693,16 @@ class SecurityContext:
                     "result_summary": result_summary,
                 },
             )
+
+    def _redact_result_preview(self, text: str) -> str:
+        """Redact credential-shaped substrings from an audit preview."""
+        inspector = self.dlp_inspector or get_dlp_inspector()
+        if not getattr(inspector, "enabled", False):
+            # DLP disabled: still apply the cheap value-pattern pass so the
+            # log sink itself never stores obvious credentials.
+            fallback = ResultDLPInspector(enabled=True)
+            return fallback._redact_content(text)
+        return inspector._redact_content(text)
 
 
 class HSTSMiddleware(BaseHTTPMiddleware):

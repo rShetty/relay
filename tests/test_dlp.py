@@ -251,3 +251,193 @@ class TestExecuteToolDLPIntegration:
         result = resp.json()["result"]
         # With DLP off the raw secret passes through untouched.
         assert result["message"].endswith("relay_QWERTYUIOPASDFGHJKLZXCVBNM12345")
+
+
+# -----------------------------------------------------------------------------
+# Issue #12: config gating, block mode, and violation auditing
+# -----------------------------------------------------------------------------
+
+class TestScanAndEnforce:
+    def setup_method(self):
+        self.dlp = ResultDLPInspector()
+
+    def test_scan_reports_violations_without_mutating(self):
+        result = {"message": "bad relay_ABCDEFGHIJKLMNOPQRSTUVWXYZ12345 key"}
+        findings = self.dlp.scan_result(result)
+        assert len(findings) == 1
+        kind, preview = findings[0]
+        assert kind.startswith("value_pattern:")
+        assert "[REDACTED]" in preview
+        assert "relay_ABCDEFGHIJKLMNOPQRSTUVWXYZ12345" not in preview
+        # original untouched
+        assert "relay_ABCDEFGHIJKLMNOPQRSTUVWXYZ12345" in result["message"]
+
+    def test_enforce_redact_mode_returns_sanitized(self):
+        dlp = ResultDLPInspector(enabled=True, mode="redact")
+        out, violations = dlp.enforce({"token": "hunter2"})
+        assert out == {"token": "[REDACTED]"}
+        assert len(violations) == 1
+
+    def test_enforce_block_mode_rejects_violating_result(self):
+        dlp = ResultDLPInspector(enabled=True, mode="block")
+        out, violations = dlp.enforce({"password": "hunter2"})
+        assert out is None
+        assert violations
+
+    def test_enforce_block_mode_passes_clean_result(self):
+        dlp = ResultDLPInspector(enabled=True, mode="block")
+        out, violations = dlp.enforce({"note": "all clear"})
+        assert out == {"note": "all clear"}
+        assert violations == []
+
+    def test_invalid_mode_rejected(self):
+        with pytest.raises(ValueError):
+            ResultDLPInspector(mode="shred")
+
+    def test_format_violations_caps_and_serializes(self):
+        from security.dlp import MAX_VIOLATIONS_PER_EVENT
+
+        noisy = {f"api_key_{i}": f"sk-{'a' * 20}{i}" for i in range(30)}
+        dlp = ResultDLPInspector()
+        formatted = ResultDLPInspector.format_violations(dlp.scan_result(noisy))
+        assert len(formatted) <= MAX_VIOLATIONS_PER_EVENT
+        assert all(set(item) == {"type", "preview"} for item in formatted)
+
+
+class TestResultDLPSettings:
+    def test_env_var_name_gates_result_dlp(self, monkeypatch):
+        from config.settings import SecuritySettings
+
+        s = SecuritySettings(RESULT_DLP_ENABLED=False)
+        assert s.result_dlp_enabled is False
+        s2 = SecuritySettings()
+        assert s2.result_dlp_enabled is True
+
+    def test_mode_env_var(self, monkeypatch):
+        from config.settings import SecuritySettings
+
+        s = SecuritySettings(RESULT_DLP_MODE="block")
+        assert s.result_dlp_mode == "block"
+
+    def test_invalid_mode_rejected_at_config(self):
+        from pydantic import ValidationError
+        from config.settings import SecuritySettings
+
+        with pytest.raises(ValidationError):
+            SecuritySettings(RESULT_DLP_MODE="explode")
+
+
+def _make_client_audited(tmp_audit_path, mode="redact", backend_result=None):
+    """Like _make_client but with a real audit log and configurable DLP mode."""
+    import gateway.server as server_module
+    from auth.oauth import create_oauth_provider
+    from auth.oauth_providers import create_oauth_provider as create_connector_oauth
+    from backends.manager import BackendDefinition, BackendManager, BackendType
+    from connectors import ConnectorRegistry
+    from security.middleware import (
+        AuditLogger,
+        InputValidator,
+        IPRestrictions,
+        RateLimiter,
+        SecurityContext,
+    )
+    from config.settings import RelayConfig
+
+    config = RelayConfig()
+    audit = AuditLogger(str(tmp_audit_path), enabled=True)
+
+    defn = BackendDefinition(
+        id="leaky_backend",
+        name="Leaky Backend",
+        description="echoes credentials",
+        backend_type=BackendType.API_REST,
+        tools=["leak_tool"],
+    )
+    backends = BackendManager()
+    backends.register_backend(defn)
+    backends._tool_index["leak_tool"] = "leaky_backend"
+
+    async def _stub_call(*args, **kwargs):
+        return True, backend_result
+
+    backends.call_tool = _stub_call
+
+    server_module.state = server_module.AppState(
+        config=config,
+        oauth=create_oauth_provider("test-secret-key-dlp"),
+        connector_oauth=create_connector_oauth(config),
+        security=SecurityContext(
+            rate_limiter=RateLimiter(600, 10000),
+            validator=InputValidator(),
+            audit_logger=audit,
+            ip_restrictions=IPRestrictions(),
+            dlp_inspector=ResultDLPInspector(enabled=True, mode=mode),
+        ),
+        backends=backends,
+        connectors=ConnectorRegistry(),
+    )
+    return TestClient(server_module.app, base_url="https://testserver", raise_server_exceptions=False)
+
+
+class TestDLPAuditAndBlock:
+    @pytest.fixture(autouse=True)
+    def _trusted_proxy(self, monkeypatch):
+        monkeypatch.setenv("TRUSTED_PROXY", "1")
+        yield
+
+    def _call(self, client, key):
+        return client.post(
+            "/v1/call",
+            json={"tool_name": "leak_tool", "arguments": {}},
+            headers={
+                "Authorization": f"Bearer {key}",
+                "X-Forwarded-For": "203.0.113.7",
+            },
+        )
+
+    def test_redact_mode_logs_violation_with_redacted_preview(self, tmp_path):
+        audit_path = tmp_path / "audit-dlp.log"
+        client = _make_client_audited(audit_path, mode="redact", backend_result=LEAKING_RESULT)
+        key = _mint_key(client, "dlp_audit_a")
+        secret = "relay_QWERTYUIOPASDFGHJKLZXCVBNM12345"
+        resp = self._call(client, key)
+        assert resp.status_code == 200
+        assert secret not in json.dumps(resp.json())
+
+        entries = [
+            json.loads(line) for line in audit_path.read_text().splitlines() if line.strip()
+        ]
+        violations = [e for e in entries if e.get("event_type") == "dlp_result_violation"]
+        assert violations, "expected a dlp_result_violation audit event"
+        vjson = json.dumps(violations)
+        assert secret not in vjson, "audit must never contain the raw secret"
+        assert "[REDACTED]" in vjson
+        assert violations[0]["details"]["mode"] == "redact"
+        assert violations[0]["resource"] == "leak_tool"
+
+        summaries = [
+            e["details"].get("result_summary", "")
+            for e in entries if e.get("event_type") == "tool_call"
+        ]
+        assert summaries, "expected tool_call audit event"
+        assert all(secret not in s for s in summaries)
+
+    def test_block_mode_blocks_response_and_logs_violation(self, tmp_path):
+        audit_path = tmp_path / "audit-block.log"
+        client = _make_client_audited(audit_path, mode="block", backend_result=LEAKING_RESULT)
+        key = _mint_key(client, "dlp_audit_b")
+        secret = "relay_QWERTYUIOPASDFGHJKLZXCVBNM12345"
+        resp = self._call(client, key)
+        assert resp.status_code == 400
+        body = json.dumps(resp.json())
+        assert "dlp_result_blocked" in body
+        assert secret not in body, "blocked response must not leak the secret"
+
+        entries = [
+            json.loads(line) for line in audit_path.read_text().splitlines() if line.strip()
+        ]
+        violations = [e for e in entries if e.get("event_type") == "dlp_result_violation"]
+        assert violations
+        assert violations[0]["success"] is False
+        assert violations[0]["details"]["mode"] == "block"
+        assert secret not in json.dumps(violations)
