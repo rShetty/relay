@@ -2713,6 +2713,9 @@ class ToolCallRequest(BaseModel):
     timeout: int = 120
 
 
+# Server-side ceiling for caller-supplied tool-call timeouts (seconds).
+MAX_TOOL_CALL_TIMEOUT = int(os.environ.get("RELAY_MAX_TOOL_CALL_TIMEOUT", "60"))
+
 async def _execute_tool(
     tool_name: str,
     arguments: Dict[str, Any],
@@ -2738,6 +2741,8 @@ async def _execute_tool(
     1. Look up a user-specific token in the TokenStore for the connector.
     2. Fall back to the shared env-var credential registered at startup.
     """
+    # Enforce server-side ceiling regardless of caller-supplied value.
+    timeout = min(max(1, int(timeout)), MAX_TOOL_CALL_TIMEOUT)
     allowed, info = state.security.check_request(
         client_id=user["client_id"],
         ip_address=ip,
