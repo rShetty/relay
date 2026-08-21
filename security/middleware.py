@@ -207,7 +207,14 @@ class InputValidator:
         r"private[_-]?key",
     ]
 
-    MAX_PATTERN_LENGTH = 1000
+    # Long strings are scanned in overlapping chunks rather than blanket-
+    # rejected, so legitimate large payloads (documents, base64 blobs,
+    # big JSON) pass validation while injection patterns remain correct
+    # on short strings AND across chunk boundaries.
+    SCAN_CHUNK_SIZE = 8192
+    # Must exceed the longest fixed-length match of any DANGEROUS_PATTERNS
+    # entry so matches near a chunk boundary are seen by the next chunk.
+    SCAN_CHUNK_OVERLAP = 256
 
     def __init__(
         self,
@@ -227,9 +234,44 @@ class InputValidator:
             re.IGNORECASE
         )
 
+    def _contains_dangerous_pattern(self, value: str) -> bool:
+        """
+        Scan *value* for dangerous patterns with bounded work per chunk.
+
+        Short strings are scanned in one pass. Longer strings are scanned in
+        overlapping chunks (``SCAN_CHUNK_SIZE`` with ``SCAN_CHUNK_OVERLAP``
+        carried between chunks) which keeps per-chunk regex work and peak
+        memory bounded for very large payloads — i.e. safe to run on strings
+        produced by streaming sources.
+
+        Anchored patterns such as ``--\\s*$`` are evaluated against each
+        chunk's tail; the final chunk always ends at the true end of the
+        input, so end-of-input anchors still behave correctly overall.
+
+        Known trade-off (documented): a ``select ... from`` construct whose
+        two halves are separated by more than the overlap window AND straddle
+        a chunk boundary may evade detection. Acceptable for this control.
+        """
+        if len(value) <= self.SCAN_CHUNK_SIZE:
+            return bool(self._dangerous_re.search(value))
+
+        step = self.SCAN_CHUNK_SIZE - self.SCAN_CHUNK_OVERLAP
+        start = 0
+        while start < len(value):
+            chunk = value[start:start + self.SCAN_CHUNK_SIZE]
+            if self._dangerous_re.search(chunk):
+                return True
+            if start + self.SCAN_CHUNK_SIZE >= len(value):
+                break
+            start += step
+        return False
+
     def validate_string(self, value: str, field_name: str = "input") -> tuple[bool, str]:
         """
         Validate a string value.
+
+        Strings up to ``max_string_length`` are accepted after a
+        dangerous-pattern scan; only oversized strings are rejected outright.
 
         Returns:
             (is_valid, sanitized_value_or_error)
@@ -237,12 +279,8 @@ class InputValidator:
         if len(value) > self.max_string_length:
             return False, f"{field_name} exceeds maximum length ({self.max_string_length})"
         
-        if len(value) > self.MAX_PATTERN_LENGTH:
-            logger.warning(f"Input too long for pattern matching in {field_name}")
-            return False, f"{field_name} too long for security validation"
-        
         try:
-            if self._dangerous_re.search(value):
+            if self._contains_dangerous_pattern(value):
                 logger.warning(f"Potential injection detected in {field_name}")
                 return False, f"{field_name} contains potentially dangerous content"
         except re.error:

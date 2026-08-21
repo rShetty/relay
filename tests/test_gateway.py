@@ -255,6 +255,42 @@ class TestInputValidator:
         assert valid is False
         assert "exceeds maximum length" in result
 
+    def test_long_string_scanned_not_rejected(self):
+        # Issue #9: strings above the old MAX_PATTERN_LENGTH (1000) must be
+        # scanned rather than blanket-rejected.
+        from security.middleware import InputValidator
+        v = InputValidator()
+        payload = ("Lorem ipsum dolor sit amet. " * 200)  # ~5600 chars, benign
+        assert len(payload) > 1000
+        valid, result = v.validate_string(payload, "document")
+        assert valid is True
+        assert result == payload
+
+    def test_long_string_with_dangerous_pattern_rejected(self):
+        from security.middleware import InputValidator
+        v = InputValidator()
+        payload = ("safe text here. " * 400) + "; rm -rf /"
+        assert len(payload) > 1000
+        valid, result = v.validate_string(payload, "document")
+        assert valid is False
+        assert "dangerous content" in result
+
+    def test_dangerous_pattern_spanning_chunk_boundary_caught(self):
+        from security.middleware import InputValidator
+        v = InputValidator()
+        # Pattern straddles the SCAN_CHUNK_SIZE boundary.
+        payload = "x" * (InputValidator.SCAN_CHUNK_SIZE - 10) + " union select " + "y" * 500
+        assert len(payload) > InputValidator.SCAN_CHUNK_SIZE
+        valid, _ = v.validate_string(payload, "document")
+        assert valid is False
+
+    def test_oversize_string_still_rejected(self):
+        from security.middleware import InputValidator
+        v = InputValidator(max_string_length=100000)
+        valid, result = v.validate_string("a" * 100001, "blob")
+        assert valid is False
+        assert "exceeds maximum length" in result
+
     def test_dangerous_sql_pattern(self):
         from security.middleware import InputValidator
         v = InputValidator()
@@ -1141,6 +1177,65 @@ class TestUserAuth:
         assert "session" in resp.cookies
 
         server_module.state = None
+
+    def test_session_cookie_secure_flag_tied_to_environment(self):
+        # Issue #9: the session cookie must be marked Secure unless
+        # RELAY_ALLOW_INSECURE_COOKIES=1 (dev-only escape hatch).
+        from fastapi.testclient import TestClient
+        import gateway.server as server_module
+        from auth.oauth import create_oauth_provider
+        from auth.oauth_providers import create_oauth_provider as create_connector_oauth
+        from backends.manager import BackendManager
+        from config.settings import RelayConfig
+        from connectors import ConnectorRegistry
+        from security.middleware import AuditLogger, InputValidator, IPRestrictions, RateLimiter, SecurityContext
+
+        audit = AuditLogger(log_path="/tmp/test_audit_cookie.log", enabled=False)
+
+        def _setup(allow_insecure: bool):
+            config = RelayConfig(
+                environment="development",
+                allow_insecure_cookies=allow_insecure,
+            )
+            oauth = create_oauth_provider("test-secret-key-cookie")
+            connector_oauth = create_connector_oauth(config)
+            security = SecurityContext(
+                rate_limiter=RateLimiter(60, 1000),
+                validator=InputValidator(),
+                audit_logger=audit,
+                ip_restrictions=IPRestrictions(),
+            )
+            server_module.state = server_module.AppState(
+                config=config, oauth=oauth, connector_oauth=connector_oauth,
+                security=security, backends=BackendManager(),
+                connectors=ConnectorRegistry(),
+            )
+            return TestClient(server_module.app, base_url="https://testserver", raise_server_exceptions=False)
+
+        try:
+            client = _setup(allow_insecure=False)
+            self._register_user(client, "cookieuser", "TestPass123")
+            resp = self._login_user(client, "cookieuser", "TestPass123")
+            assert resp.status_code == 200
+            set_cookie = resp.headers.get("set-cookie", "")
+            session_part = next(
+                (p for p in set_cookie.split(", ") if p.startswith("session=")), ""
+            )
+            assert session_part, f"no session cookie in Set-Cookie: {set_cookie}"
+            assert "Secure" in session_part.split("; ")
+
+            client2 = _setup(allow_insecure=True)
+            self._register_user(client2, "cookieuser2", "TestPass123")
+            resp2 = self._login_user(client2, "cookieuser2", "TestPass123")
+            assert resp2.status_code == 200
+            set_cookie2 = resp2.headers.get("set-cookie", "")
+            session_part2 = next(
+                (p for p in set_cookie2.split(", ") if p.startswith("session=")), ""
+            )
+            assert session_part2, f"no session cookie in Set-Cookie: {set_cookie2}"
+            assert "Secure" not in session_part2.split("; ")
+        finally:
+            server_module.state = None
 
     def test_login_wrong_password(self):
         from fastapi.testclient import TestClient
