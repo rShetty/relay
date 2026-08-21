@@ -356,12 +356,19 @@ class AuditLogger:
         log_path: str,
         enabled: bool = True,
         sensitive_fields: Optional[List[str]] = None,
+        max_bytes: int = 100 * 1024 * 1024,
+        max_files: int = 10,
+        retention_days: Optional[int] = None,
     ):
         self.enabled = enabled
         self.log_path = log_path
         self.sensitive_fields = set(sensitive_fields or [])
+        self.max_bytes = max_bytes
+        self.max_files = max_files
+        self.retention_days = retention_days
         self._last_hash: str = ""
         self._ensure_log_directory()
+        self._prune_expired_rotations()
         self._load_last_hash()
 
     def _ensure_log_directory(self) -> None:
@@ -441,8 +448,9 @@ class AuditLogger:
 
         final_entry = json.dumps(log_dict)
 
-        # Log to file
+        # Log to file (with size-based rotation)
         try:
+            self._rotate_if_needed()
             with open(self.log_path, "a") as f:
                 f.write(final_entry + "\n")
         except Exception as e:
@@ -455,6 +463,42 @@ class AuditLogger:
             f"AUDIT: {event.event_type} client={event.client_id[:12]}... "
             f"user={event.user_id} action={event.action} success={event.success}"
         )
+
+    def _rotate_if_needed(self) -> None:
+        """Rotate the audit log when it exceeds max_bytes (keeps max_files)."""
+        try:
+            if not os.path.exists(self.log_path):
+                return
+            if os.path.getsize(self.log_path) < self.max_bytes:
+                return
+            # Shift existing rotations: .N -> .N+1 (oldest dropped)
+            oldest = f"{self.log_path}.{self.max_files}"
+            if os.path.exists(oldest):
+                os.remove(oldest)
+            for i in range(self.max_files - 1, 0, -1):
+                src = f"{self.log_path}.{i}"
+                if os.path.exists(src):
+                    os.replace(src, f"{self.log_path}.{i + 1}")
+            os.replace(self.log_path, f"{self.log_path}.1")
+        except Exception as e:
+            logger.error(f"Audit log rotation failed: {e}")
+
+    def _prune_expired_rotations(self) -> None:
+        """Delete rotated audit files older than retention_days."""
+        if not self.retention_days:
+            return
+        try:
+            import time as _time
+            cutoff = _time.time() - self.retention_days * 86400
+            directory = os.path.dirname(self.log_path) or "."
+            base = os.path.basename(self.log_path)
+            for name in os.listdir(directory):
+                if name.startswith(base + "."):
+                    path = os.path.join(directory, name)
+                    if os.path.getmtime(path) < cutoff:
+                        os.remove(path)
+        except Exception as e:
+            logger.error(f"Audit log retention pruning failed: {e}")
 
     def _hash_ip(self, ip: str) -> str:
         """Hash IP address for privacy (one-way, not reversible)."""
