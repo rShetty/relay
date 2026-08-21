@@ -29,6 +29,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 if TYPE_CHECKING:
     from fastapi import Request
+    from security.dlp import ResultDLPInspector
 
 logger = logging.getLogger(__name__)
 
@@ -598,11 +599,14 @@ class SecurityContext:
         validator: Optional[InputValidator] = None,
         audit_logger: Optional[AuditLogger] = None,
         ip_restrictions: Optional[IPRestrictions] = None,
+        dlp_inspector: Optional["ResultDLPInspector"] = None,
     ):
         self.rate_limiter = rate_limiter or RateLimiter()
         self.validator = validator or InputValidator()
         self.audit = audit_logger
         self.ip = ip_restrictions or IPRestrictions()
+        # Result-DLP inspector; None means "use the process-wide default".
+        self.dlp_inspector = dlp_inspector
 
     def check_request(
         self,

@@ -64,6 +64,18 @@ from security.middleware import (
     MetricsMiddleware,
 )
 from security.csrf import CSRFMiddleware
+from security.dlp import ResultDLPInspector, get_dlp_inspector, set_dlp_inspector
+
+
+def _dlp_inspect(result: Any) -> Any:
+    """Run result-DLP using the state-configured inspector when available."""
+    app_state = globals().get("state")
+    inspector = None
+    if app_state is not None:
+        inspector = getattr(app_state.security, "dlp_inspector", None)
+    if inspector is None:
+        inspector = get_dlp_inspector()
+    return inspector.inspect_result(result)
 from backends.manager import (
     BackendManager, 
     BackendDefinition, 
@@ -181,6 +193,7 @@ def _create_app_state_sync(config: RelayConfig) -> AppState:
             whitelist=config.security.ip_whitelist,
             blacklist=config.security.ip_blacklist,
         ),
+        dlp_inspector=ResultDLPInspector(enabled=config.security.dlp_enabled),
     )
 
     # Configure Redis for distributed rate limiting (if available)
@@ -348,6 +361,7 @@ async def lifespan(app: FastAPI):
             whitelist=config.security.ip_whitelist,
             blacklist=config.security.ip_blacklist,
         ),
+        dlp_inspector=ResultDLPInspector(enabled=config.security.dlp_enabled),
     )
 
     # Configure Redis for distributed rate limiting (if available)
@@ -2895,6 +2909,12 @@ async def _execute_tool(
         result_summary=str(result)[:200] if result else None,
     )
 
+    # DLP: scrub credential-shaped content from results before they reach
+    # the caller / model context. Disable by calling set_dlp_inspector(None)
+    # or installing a disabled inspector.
+    if success:
+        result = _dlp_inspect(result)
+
     return success, result
 
 
@@ -3408,10 +3428,11 @@ def create_mcp_server(app_state: Optional["AppState"] = None, init_state: bool =
             )
         else:
             return json.dumps({"error": f"Tool '{tool_name}' not found in any backend or connector"})
-        
+
         if not success:
             return json.dumps({"error": result})
-        return json.dumps({"result": result})
+        # DLP: scrub credential-shaped content before returning to the caller.
+        return json.dumps({"result": _dlp_inspect(result)})
     
     # --- Gateway management tools ---
     
@@ -3664,7 +3685,8 @@ def _build_mcp_tool_handler(
         )
         if not success:
             return json.dumps({"error": result})
-        return json.dumps({"result": result})
+        # DLP: scrub credential-shaped content before returning to the caller.
+        return json.dumps({"result": _dlp_inspect(result)})
 
     sig_params = []
     for pname in param_names:

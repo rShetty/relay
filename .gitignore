@@ -85,3 +85,4 @@ opencode.json
 cookies.txt
 .venv*/
 venv/
+__pycache__/

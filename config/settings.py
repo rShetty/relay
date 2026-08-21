@@ -133,6 +133,9 @@ class SecuritySettings(BaseSettings):
     ip_whitelist: List[str] = Field(default_factory=list)
     ip_blacklist: List[str] = Field(default_factory=list)
 
+    # Result DLP (credential-shaped content scrubbed from tool call results)
+    dlp_enabled: bool = True
+
     # CSRF protection
     csrf_enabled: bool = True
     csrf_secret_key: str = Field(default_factory=lambda: secrets.token_urlsafe(32))
