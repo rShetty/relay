@@ -2139,6 +2139,79 @@ async def discover_connectors():
 # API Key Authentication (Alternative to OAuth)
 # -----------------------------------------------------------------------------
 
+async def resolve_principal(request: Request) -> Optional[Dict[str, Any]]:
+    """
+    Resolve the caller's identity from (in order):
+      1. ``Authorization``/``ApiKey`` header carrying an OAuth bearer token
+         or DB-backed API key (``relay_...``)
+      2. Session cookie (web UI login)
+
+    An explicit credential header wins over an ambient browser cookie so
+    machine clients are never mis-attributed to a logged-in user.
+
+    Returns a principal dict (user_id, client_id, is_admin, auth_method)
+    or None when unauthenticated.
+    """
+    app_state = _get_state()
+
+    authorization = request.headers.get("Authorization") or request.headers.get("ApiKey")
+
+    if authorization:
+        token = authorization[7:] if authorization.startswith("Bearer ") else authorization
+        if token:
+            # DB-backed API key
+            if token.startswith("relay_"):
+                from auth.database import get_api_key
+                key_data = get_api_key(token)
+                if not key_data:
+                    return None
+                return {
+                    "user_id": key_data["user_id"],
+                    "username": None,
+                    "client_id": f"apikey:{key_data['name']}",
+                    "is_admin": False,
+                    "auth_method": "api_key",
+                }
+
+            # OAuth bearer token
+            user_info = app_state.oauth.validate_access_token(token)
+            if not user_info:
+                return None
+            from auth.database import is_user_admin
+            user_id = user_info.get("user_id")
+            return {
+                "user_id": user_id,
+                "username": user_info.get("username"),
+                "client_id": user_info.get("client_id", "unknown"),
+                "is_admin": bool(is_user_admin(user_id)),
+                "auth_method": "oauth",
+            }
+
+    # Session cookie fallback
+    session_user = get_user_from_session(request)
+    if session_user:
+        return {
+            "user_id": session_user["id"],
+            "username": session_user.get("username"),
+            "client_id": "session",
+            "is_admin": bool(session_user.get("is_admin")),
+            "auth_method": "session",
+        }
+
+    return None
+
+
+async def get_authenticated_principal(request: Request) -> Dict[str, Any]:
+    """FastAPI dependency: require any supported credential type."""
+    principal = await resolve_principal(request)
+    if not principal:
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required (session cookie, Bearer token, or API key)",
+        )
+    return principal
+
+
 async def get_current_user_api_key(
     request: Request,
     authorization: Optional[str] = None,
@@ -2149,8 +2222,10 @@ async def get_current_user_api_key(
     Supports:
     - Bearer token (OAuth access token)
     - ApiKey header (simple API key)
+    - DB-backed API keys (relay_...) created via POST /v1/api-keys
     
-    For API keys, the key IS the access token (created via OAuth register).
+    For API keys, the key IS the access token (created via OAuth register
+    or the api_keys table).
     """
     if not authorization:
         authorization = request.headers.get("Authorization") or request.headers.get("ApiKey")
@@ -2168,50 +2243,124 @@ async def get_current_user_api_key(
         # Treat as raw API key
         token = authorization
     
-    # Validate token
+    # Validate OAuth bearer token
     user_info = state.oauth.validate_access_token(token)
-    if not user_info:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    if user_info:
+        return user_info
+
+    # Fall back to DB-backed API key lookup (owner-scoped credential)
+    if token.startswith("relay_"):
+        from auth.database import get_api_key, update_api_key_last_used
+        key_data = get_api_key(token)
+        if key_data:
+            update_api_key_last_used(token)
+            return {
+                "user_id": key_data["user_id"],
+                "client_id": f"apikey:{key_data['name']}",
+                "scope": "mcp:tools",
+            }
     
-    return user_info
+    raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+
+class V1ApiKeyCreateRequest(BaseModel):
+    """Request body for POST /v1/api-keys."""
+    client_name: str
+    # Accepted for backward compatibility with the previous payload shape;
+    # redirect URIs are not used for DB-backed API keys.
+    redirect_uris: Optional[List[str]] = None
+    expires_days: Optional[int] = None
+
+
+def _mask_key(key: str) -> str:
+    """Return a non-secret prefix of an API key for listing responses."""
+    return key[:12] + "..." if len(key) > 12 else key
 
 
 @app.post("/v1/api-keys", tags=["API Keys"])
-async def create_api_key(
-    req: ClientRegistrationRequest,
+async def create_api_key_v1(
+    req: V1ApiKeyCreateRequest,
+    principal: Dict[str, Any] = Depends(get_authenticated_principal),
 ):
     """
-    Create a simple API key for programmatic access.
-    
-    This is a simplified flow for CLIs and SDKs that don't want OAuth:
-    1. Register with a name and callback URL
-    2. Get an API key (sk-...) immediately
-    3. Use the API key in Authorization: Bearer sk-... or ApiKey: sk-...
+    Create a DB-backed API key bound to the authenticated principal.
+
+    Requires authentication (session cookie, OAuth Bearer token, or an
+    existing API key). The key carries owner metadata and can be used as
+    ``Authorization: Bearer relay_...`` on /v1/* endpoints.
+
+    Example:
+        curl -X POST https://gateway/v1/api-keys \\
+          -H "Authorization: Bearer <session-or-oauth-token>" \\
+          -H "Content-Type: application/json" \\
+          -d '{"client_name": "my-cli"}'
     """
-    # Register as OAuth client
-    client = state.oauth.register_client(
-        client_name=req.client_name,
-        redirect_uris=req.redirect_uris or ["urn:ietf:wg:oauth:2.0:oob"],
-        is_confidential=False,  # Public client for API key flow
+    from auth.database import create_api_key
+
+    name = (req.client_name or "").strip()[:64] or "unnamed"
+    key = create_api_key(
+        user_id=principal["user_id"],
+        name=name,
+        expires_days=req.expires_days,
     )
-    
-    # Create an access token directly (bypass OAuth flow)
-    # The API key IS the access token
-    token_pair = state.oauth._create_token_pair(
-        client_id=client.client_id,
-        user_id=f"api-key-{client.client_name}",
-        scope="mcp:tools",
-    )
-    
+
+    if state.security.audit:
+        state.security.audit.log(
+            event_type="api_key_created",
+            client_id=principal.get("client_id", "unknown"),
+            user_id=principal["user_id"],
+            ip_address="unknown",
+            resource="api-keys",
+            action="create",
+            success=True,
+            details={"name": name, "auth_method": principal["auth_method"]},
+        )
+
     return {
-        "api_key": token_pair.access_token,
-        "client_id": client.client_id,
-        "client_name": client.client_name,
-        "expires_in": token_pair.expires_in,
-        "usage": {
-            "header": "Authorization: Bearer <api_key>",
-            "alt_header": "ApiKey: <api_key>",
+        "api_key": key,
+        "client_name": name,
+        "owner": {
+            "user_id": principal["user_id"],
+            "auth_method": principal["auth_method"],
         },
+        "usage": {
+            "header": f"Authorization: Bearer {key}",
+            "alt_header": f"ApiKey: {key}",
+        },
+    }
+
+
+@app.get("/v1/api-keys", tags=["API Keys"])
+async def list_api_keys_v1(
+    include_all: bool = False,
+    principal: Dict[str, Any] = Depends(get_authenticated_principal),
+):
+    """
+    List API keys. Non-admin callers see only their own keys; admins may
+    pass ``include_all=true`` to list every key with owner metadata.
+    Full key material is never returned by this endpoint.
+    """
+    from auth.database import list_api_keys, list_all_api_keys
+
+    if principal["is_admin"] and include_all:
+        rows = list_all_api_keys()
+    else:
+        rows = list_api_keys(principal["user_id"])
+
+    return {
+        "keys": [
+            {
+                "key_prefix": _mask_key(r["key"]),
+                "user_id": r["user_id"],
+                "name": r["name"],
+                "created_at": r["created_at"],
+                "expires_at": r["expires_at"],
+                "last_used_at": r["last_used_at"],
+                "is_active": r["is_active"],
+            }
+            for r in rows
+        ],
+        "scoped_to_owner": not (principal["is_admin"] and include_all),
     }
 
 

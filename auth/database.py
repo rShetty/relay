@@ -819,6 +819,16 @@ def list_api_keys(user_id: str) -> List[Dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
+def list_all_api_keys() -> List[Dict[str, Any]]:
+    """List every API key across users (admin-only reporting)."""
+    conn = get_connection()
+    rows = conn.execute(
+        """SELECT key, user_id, name, last_used_at, created_at, expires_at, is_active
+           FROM api_keys ORDER BY created_at DESC"""
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def delete_api_key(user_id: str, key: str) -> bool:
     """Delete (deactivate) an API key."""
     conn = get_connection()
