@@ -683,6 +683,18 @@ async def register_client(req: ClientRegistrationRequest):
     }
 
 
+def _verify_consent_csrf(request: Request, submitted_token: Optional[str]) -> bool:
+    """Double-submit CSRF check for the consent form (the /oauth/ prefix is
+    exempt from the global CSRF middleware because machine clients use it
+    without cookies; the consent form is cookie-authenticated so it verifies
+    its own token)."""
+    cookie_token = request.cookies.get("csrf_token")
+    if not cookie_token or not submitted_token:
+        return False
+    import hmac
+    return hmac.compare_digest(cookie_token, submitted_token)
+
+
 @app.get("/oauth/authorize", tags=["OAuth"])
 async def authorize_page(
     client_id: str,
@@ -696,9 +708,11 @@ async def authorize_page(
     """
     OAuth authorization endpoint.
 
-    Requires an authenticated user session. The user must be logged in
-    to authorize an OAuth client. In development with no users registered,
-    a demo user fallback can be enabled via RELAY_ENABLE_DEMO_USER=true.
+    Requires an authenticated user session. Renders a consent screen bound
+    to that session showing the client and requested scopes. Approve/deny
+    decisions are persisted per (user, client, scope); a stored approval
+    issues a code immediately, a stored denial redirects back with
+    ``error=access_denied``. Unauthenticated requests redirect to login.
     """
     app_state = _get_state()
 
@@ -719,7 +733,81 @@ async def authorize_page(
             login_url += f"&oauth_state={oauth_state}"
         return RedirectResponse(url=login_url)
 
-    # Create authorization code bound to the authenticated user
+    # Honor persisted consent decisions for this exact scope
+    from auth.database import get_oauth_consent
+    consent = get_oauth_consent(user["id"], client_id, scope)
+    if consent and consent["decision"] == "denied":
+        if app_state.security.audit:
+            app_state.security.audit.log(
+                event_type="oauth_consent_denied",
+                client_id=client_id,
+                user_id=user["id"],
+                ip_address="unknown",
+                resource="oauth",
+                action="authorize",
+                success=False,
+                details={"scope": scope, "persisted": True},
+            )
+        sep = "&" if "?" in redirect_uri else "?"
+        deny_url = f"{redirect_uri}{sep}error=access_denied"
+        if oauth_state:
+            deny_url += f"&state={oauth_state}"
+        return RedirectResponse(url=deny_url)
+
+    if consent and consent["decision"] == "approved":
+        code = _issue_authorization_code(
+            app_state, client_id=client_id, redirect_uri=redirect_uri,
+            code_challenge=code_challenge, code_challenge_method=code_challenge_method,
+            scope=scope, user=user,
+        )
+        sep = "&" if "?" in redirect_uri else "?"
+        redirect_url = f"{redirect_uri}{sep}code={code}"
+        if oauth_state:
+            redirect_url += f"&state={oauth_state}"
+        return RedirectResponse(url=redirect_url)
+
+    # No persisted decision: render the consent screen
+    csrf_token = request.cookies.get("csrf_token") or secrets.token_urlsafe(32)
+    hidden_params = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "code_challenge": code_challenge,
+        "code_challenge_method": code_challenge_method,
+        "scope": scope,
+    }
+    if oauth_state:
+        hidden_params["oauth_state"] = oauth_state
+
+    response = render_template(
+        "consent.html",
+        user=user,
+        client_id=client_id,
+        client_name=getattr(client, "client_name", None) or client_id,
+        scope_list=[s for s in scope.split() if s],
+        hidden_params=hidden_params,
+        csrf_token=csrf_token,
+    )
+    response.set_cookie(
+        key="csrf_token",
+        value=csrf_token,
+        httponly=False,
+        samesite="lax" if not app_state.config.is_production else "strict",
+        secure=not app_state.config.allow_insecure_cookies,
+        path="/",
+    )
+    return response
+
+
+def _issue_authorization_code(
+    app_state: AppState,
+    client_id: str,
+    redirect_uri: str,
+    code_challenge: str,
+    code_challenge_method: str,
+    scope: str,
+    user: Dict[str, Any],
+) -> str:
+    """Create an authorization code bound to the authenticated user and audit it."""
     code = app_state.oauth.create_authorization_code(
         client_id=client_id,
         redirect_uri=redirect_uri,
@@ -729,7 +817,7 @@ async def authorize_page(
         user_id=user["id"],
     )
 
-    # Log the authorization
+    # Log the authorization with the real authenticated user id
     if app_state.security.audit:
         app_state.security.audit.log(
             event_type="oauth_authorize",
@@ -741,16 +829,103 @@ async def authorize_page(
             success=True,
             details={"scope": scope},
         )
+    return code
 
-    redirect_url = f"{redirect_uri}?code={code}"
+
+@app.post("/oauth/authorize/consent", tags=["OAuth"])
+async def authorize_consent(request: Request):
+    """
+    Handle the consent form submission (or an equivalent JSON body).
+
+    Bound to the authenticated session; persists the approve/deny decision
+    and audits it with the real user id and client_id. On approval an
+    authorization code is issued and the user is redirected to the client's
+    redirect_uri. On denial the client is redirected with error=access_denied.
+    """
+    app_state = _get_state()
+
+    form = await request.form()
+    content_type = request.headers.get("content-type", "")
+
+    def _form_or_json(key: str, default=None):
+        if key in form:
+            return form[key]
+        return default
+
+    client_id = _form_or_json("client_id")
+    redirect_uri = _form_or_json("redirect_uri")
+    code_challenge = _form_or_json("code_challenge")
+    code_challenge_method = _form_or_json("code_challenge_method", "S256")
+    scope = _form_or_json("scope", "mcp:tools")
+    oauth_state = _form_or_json("oauth_state")
+    decision = _form_or_json("decision")
+    csrf_token = _form_or_json("csrf_token")
+
+    # JSON body support for non-browser clients
+    if "application/json" in content_type:
+        try:
+            body = json.loads((await request.body()).decode() or "{}")
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="Invalid JSON body")
+        client_id = body.get("client_id", client_id)
+        redirect_uri = body.get("redirect_uri", redirect_uri)
+        code_challenge = body.get("code_challenge", code_challenge)
+        code_challenge_method = body.get("code_challenge_method", code_challenge_method)
+        scope = body.get("scope", scope)
+        oauth_state = body.get("state", oauth_state)
+        decision = body.get("decision", decision)
+
+    if not all([client_id, redirect_uri, code_challenge]) or decision not in ("approve", "deny"):
+        raise HTTPException(status_code=400, detail="Missing consent parameters or invalid decision")
+
+    # Session-bound: unauthenticated submissions are rejected
+    user = get_user_from_session(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    # Validate client and redirect URI again (never trust form data)
+    client = app_state.oauth.get_client(client_id)
+    if not client:
+        raise HTTPException(status_code=400, detail="Invalid client_id")
+    if not app_state.oauth.validate_redirect_uri(client_id, redirect_uri):
+        raise HTTPException(status_code=400, detail="Invalid redirect_uri")
+
+    # CSRF double-submit verification for cookie-authenticated form posts
+    if "application/json" not in content_type:
+        if not _verify_consent_csrf(request, csrf_token):
+            raise HTTPException(status_code=403, detail="CSRF token validation failed")
+
+    from auth.database import save_oauth_consent
+
+    sep = "&" if "?" in redirect_uri else "?"
+    if decision == "approve":
+        save_oauth_consent(user["id"], client_id, scope, "approved")
+        code = _issue_authorization_code(
+            app_state, client_id=client_id, redirect_uri=redirect_uri,
+            code_challenge=code_challenge, code_challenge_method=code_challenge_method,
+            scope=scope, user=user,
+        )
+        redirect_url = f"{redirect_uri}{sep}code={code}"
+        if oauth_state:
+            redirect_url += f"&state={oauth_state}"
+        return RedirectResponse(url=redirect_url, status_code=303)
+
+    save_oauth_consent(user["id"], client_id, scope, "denied")
+    if app_state.security.audit:
+        app_state.security.audit.log(
+            event_type="oauth_consent_denied",
+            client_id=client_id,
+            user_id=user["id"],
+            ip_address="unknown",
+            resource="oauth",
+            action="authorize",
+            success=False,
+            details={"scope": scope},
+        )
+    deny_url = f"{redirect_uri}{sep}error=access_denied"
     if oauth_state:
-        redirect_url += f"&state={oauth_state}"
-
-    return {
-        "code": code,
-        "redirect_uri": redirect_uri,
-        "state": oauth_state,
-    }
+        deny_url += f"&state={oauth_state}"
+    return RedirectResponse(url=deny_url, status_code=303)
 
 
 @app.post("/oauth/token", tags=["OAuth"])

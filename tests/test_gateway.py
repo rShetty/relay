@@ -612,6 +612,46 @@ class TestFastAPIEndpoints:
         assert login.status_code == 200, login.text
         return login.json()
 
+    def _authorize_via_consent(self, client, cid: str, scope: str = "mcp:tools",
+                               decision: str = "approve") -> str:
+        """Run the full consent flow and return the authorization code."""
+        # 1. Fetch the consent screen (sets the CSRF cookie)
+        page = client.get(
+            "/oauth/authorize",
+            params={
+                "client_id": cid,
+                "redirect_uri": "http://localhost/cb",
+                "code_challenge": "test-challenge",
+                "code_challenge_method": "S256",
+                "scope": scope,
+            },
+        )
+        assert page.status_code == 200, page.text
+        csrf_token = client.cookies.get("csrf_token")
+        assert csrf_token, "consent page must set a CSRF cookie"
+
+        # 2. Submit the decision
+        posted = client.post(
+            "/oauth/authorize/consent",
+            data={
+                "client_id": cid,
+                "redirect_uri": "http://localhost/cb",
+                "code_challenge": "test-challenge",
+                "code_challenge_method": "S256",
+                "scope": scope,
+                "decision": decision,
+                "csrf_token": csrf_token,
+            },
+            follow_redirects=False,
+        )
+        assert posted.status_code == 303, posted.text
+        location = posted.headers["location"]
+        if decision == "approve":
+            assert "code=" in location, location
+            return location.split("code=")[1].split("&")[0]
+        assert "error=access_denied" in location, location
+        return ""
+
     def test_health_returns_200(self):
         resp = self._client().get("/health")
         assert resp.status_code == 200
@@ -702,8 +742,8 @@ class TestFastAPIEndpoints:
         verifier = generate_code_verifier()
         challenge = generate_code_challenge(verifier)
 
-        # 3. Auth code (requires an authenticated session)
-        auth_resp = client.get(
+        # 3. Auth code via the consent screen (session-authenticated)
+        page = client.get(
             "/oauth/authorize",
             params={
                 "client_id": cid,
@@ -713,8 +753,25 @@ class TestFastAPIEndpoints:
                 "scope": "mcp:tools",
             },
         )
-        assert auth_resp.status_code == 200, auth_resp.text
-        code = auth_resp.json()["code"]
+        assert page.status_code == 200, page.text
+        csrf_token = client.cookies.get("csrf_token")
+        consent_resp = client.post(
+            "/oauth/authorize/consent",
+            data={
+                "client_id": cid,
+                "redirect_uri": "http://localhost/cb",
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+                "scope": "mcp:tools",
+                "decision": "approve",
+                "csrf_token": csrf_token,
+            },
+            follow_redirects=False,
+        )
+        assert consent_resp.status_code == 303, consent_resp.text
+        location = consent_resp.headers["location"]
+        assert location.startswith("http://localhost/cb"), location
+        code = location.split("code=")[1].split("&")[0]
 
         # 4. Exchange
         token_resp = client.post(
@@ -746,7 +803,7 @@ class TestFastAPIEndpoints:
         verifier = generate_code_verifier()
         challenge = generate_code_challenge(verifier)
 
-        auth_resp = client.get(
+        page = client.get(
             "/oauth/authorize",
             params={
                 "client_id": cid,
@@ -756,8 +813,23 @@ class TestFastAPIEndpoints:
                 "scope": "mcp:tools",
             },
         )
-        assert auth_resp.status_code == 200, auth_resp.text
-        code = auth_resp.json()["code"]
+        assert page.status_code == 200, page.text
+        csrf_token = client.cookies.get("csrf_token")
+        consent_resp = client.post(
+            "/oauth/authorize/consent",
+            data={
+                "client_id": cid,
+                "redirect_uri": "http://localhost/cb",
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+                "scope": "mcp:tools",
+                "decision": "approve",
+                "csrf_token": csrf_token,
+            },
+            follow_redirects=False,
+        )
+        assert consent_resp.status_code == 303, consent_resp.text
+        code = consent_resp.headers["location"].split("code=")[1].split("&")[0]
 
         tokens = client.post(
             "/oauth/token",

@@ -245,6 +245,10 @@ class RelayConfig(BaseSettings):
     # Environment
     environment: str = Field(default="development")
 
+    # Cookie security: session cookies are always marked Secure unless this
+    # explicit escape hatch is set (intended for local HTTP development only).
+    allow_insecure_cookies: bool = False
+
     # Sub-configurations
     oauth: OAuthSettings = Field(default_factory=OAuthSettings)
     github_oauth: GitHubOAuthSettings = Field(default_factory=GitHubOAuthSettings)

@@ -121,6 +121,21 @@ def init_db() -> sqlite3.Connection:
             expires_at TEXT NOT NULL
         )
     """)
+
+    # OAuth consent decisions (per user + client + scope)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS oauth_consents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            client_id TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            decision TEXT NOT NULL CHECK(decision IN ('approved','denied')),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(user_id, client_id, scope)
+        )
+    """)
+
     
     # Create indexes
     conn.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)")
@@ -493,6 +508,36 @@ def delete_auth_code(code: str) -> bool:
     cursor = conn.execute("DELETE FROM auth_codes WHERE code = ?", (code,))
     conn.commit()
     return cursor.rowcount > 0
+
+
+# -----------------------------------------------------------------------------
+# OAuth Consent Decisions
+# -----------------------------------------------------------------------------
+
+def save_oauth_consent(user_id: str, client_id: str, scope: str, decision: str) -> None:
+    """Persist an approve/deny consent decision for a user+client+scope."""
+    if decision not in ("approved", "denied"):
+        raise ValueError("decision must be 'approved' or 'denied'")
+    conn = get_connection()
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        """INSERT INTO oauth_consents (user_id, client_id, scope, decision, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(user_id, client_id, scope)
+           DO UPDATE SET decision = excluded.decision, updated_at = excluded.updated_at""",
+        (user_id, client_id, scope, decision, now, now),
+    )
+    conn.commit()
+
+
+def get_oauth_consent(user_id: str, client_id: str, scope: str) -> Optional[Dict[str, Any]]:
+    """Return the persisted consent row for user+client+scope, or None."""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT * FROM oauth_consents WHERE user_id = ? AND client_id = ? AND scope = ?",
+        (user_id, client_id, scope),
+    ).fetchone()
+    return dict(row) if row else None
 
 
 # -----------------------------------------------------------------------------
