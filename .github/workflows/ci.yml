@@ -86,3 +86,14 @@ jobs:
           image-ref: relay:ci
           severity: CRITICAL,HIGH
           exit-code: "1"
+
+  no-dynamic-exec:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assert no exec() on request paths
+        run: |
+          if grep -rn "exec(" gateway/ --include="*.py"; then
+            echo "::error::exec() found in gateway/ — dynamic code generation is forbidden"
+            exit 1
+          fi

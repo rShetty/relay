@@ -3526,144 +3526,149 @@ def create_connector_mcp_server(
         instructions=f"{connector.display_name}: {connector.description}",
     )
 
-    for tool_def in tools:
-        tool_name = tool_def.name
-        tool_desc = tool_def.description
-        tool_params = tool_def.parameters
 
-        schema_params = tool_params.get("properties", {})
-        required = tool_params.get("required", [])
+def _build_mcp_tool_handler(
+    *,
+    connector_name: str,
+    tool_def,
+    app_state,
+    fixed_user_token: Optional[str] = None,
+):
+    """Build an MCP tool handler as a closure.
 
-        params = []
-        for pname in schema_params:
-            if pname in required:
-                params.append(f"{pname}: str")
-        for pname in schema_params:
-            if pname not in required:
-                params.append(f"{pname}: Optional[str] = None")
-        if params:
-            params_str = ", ".join(params) + ", ctx: Context = None"
+    Replaces the previous exec()-based code generation: no dynamic source
+    compilation, and credentials are never interpolated into function
+    source. The handler exposes an explicit __signature__ so FastMCP schema
+    generation continues to work.
+    """
+    import inspect
+
+    tool_name = tool_def.name
+    param_props = (tool_def.parameters or {}).get("properties", {})
+    required = set((tool_def.parameters or {}).get("required", []))
+    param_names = list(param_props.keys())
+
+    async def handler(**kwargs) -> str:
+        ctx = kwargs.pop("ctx", None)
+        call_args = {k: v for k, v in kwargs.items() if k in param_names and v is not None}
+
+        user_id = None
+        if fixed_user_token is not None:
+            user_token = fixed_user_token
+            if not user_token:
+                return json.dumps({
+                    "error": f"No credentials for '{connector_name}'",
+                    "hint": f"Connect your account at /oauth/authorize/{connector_name}",
+                })
         else:
-            params_str = "ctx: Context = None"
-
-        fn_code = f"""
-async def tool_fn({params_str}) -> str:
-    _tool_param_names = {list(schema_params.keys())}
-    kwargs = {{k: v for k, v in locals().items() if k in _tool_param_names and v is not None}}
-
-    # Try to get authorization from MCP request context
-    auth_val = None
-    api_key = None
-    user_id = None
-    try:
-        if ctx is not None and ctx.request_context is not None:
-            req = ctx.request_context.request
-            if req is not None:
-                auth_val = req.headers.get("Authorization")
-                api_key = req.headers.get("X-API-Key")
-                user_id = req.headers.get("X-User-Id")
-    except Exception:
-        pass
-
-    user_token = None
-    
-    # First try X-User-Id header (set by per-user MCP endpoint)
-    if user_id:
-        try:
-            from auth.token_store import get_token_store
-            user_token = await get_token_store().get_token(user_id, "{connector_name}")
-        except Exception:
-            pass
-    
-    # Then try API key header
-    if not user_token and api_key:
-        try:
-            from auth.database import get_api_key
-            key_data = get_api_key(api_key)
-            if key_data:
-                user_id = key_data["user_id"]
-                from auth.token_store import get_token_store
-                user_token = await get_token_store().get_token(user_id, "{connector_name}")
-        except Exception:
-            pass
-    
-    # Then try JWT auth
-    if not user_token and auth_val:
-        token = auth_val[7:] if auth_val.startswith("Bearer ") else auth_val
-        user_info = app_state.oauth.validate_access_token(token)
-        if user_info:
-            user_id = user_info.get("user_id")
+            auth_val = None
+            api_key = None
+            header_user_id = None
             try:
-                from auth.token_store import get_token_store
-                user_token = await get_token_store().get_token(user_id, "{connector_name}")
+                if ctx is not None and getattr(ctx, "request_context", None) is not None:
+                    req = ctx.request_context.request
+                    if req is not None:
+                        auth_val = req.headers.get("Authorization")
+                        api_key = req.headers.get("X-API-Key")
+                        header_user_id = req.headers.get("X-User-Id")
             except Exception:
                 pass
 
-    # Check granular access permissions
-    if user_id:
-        try:
-            from auth.database import check_user_tool_access
-            if not check_user_tool_access(user_id, "{connector_name}", "{tool_name}"):
-                return json.dumps({{
-                    "error": "Access denied",
-                    "hint": "You don't have permission to use this tool. Request access at http://localhost:8000/access-requests",
-                }})
-        except Exception:
-            pass
+            user_token = None
+            if header_user_id:
+                user_id = header_user_id
+                try:
+                    from auth.token_store import get_token_store
+                    user_token = await get_token_store().get_token(user_id, connector_name)
+                except Exception:
+                    pass
+            if not user_token and api_key:
+                try:
+                    from auth.database import get_api_key
+                    key_data = get_api_key(api_key)
+                    if key_data:
+                        user_id = key_data["user_id"]
+                        from auth.token_store import get_token_store
+                        user_token = await get_token_store().get_token(user_id, connector_name)
+                except Exception:
+                    pass
+            if not user_token and auth_val:
+                token = auth_val[7:] if auth_val.startswith("Bearer ") else auth_val
+                user_info = app_state.oauth.validate_access_token(token)
+                if user_info:
+                    user_id = user_info.get("user_id")
+                    try:
+                        from auth.token_store import get_token_store
+                        user_token = await get_token_store().get_token(user_id, connector_name)
+                    except Exception:
+                        pass
 
-    # Patroclus authorization check
-    if app_state.patroclus and app_state.patroclus.enabled and user_id:
-        _decision, _reason = await app_state.patroclus.check_access(
-            agent_id=user_id,
-            action="call",
-            resource="{connector_name}/{{tool_name}}",
-            requested_scopes=["{connector_name}:{{tool_name}}"],
+            # Granular per-user/per-tool permissions.
+            if user_id:
+                try:
+                    from auth.database import check_user_tool_access
+                    if not check_user_tool_access(user_id, connector_name, tool_name):
+                        return json.dumps({
+                            "error": "Access denied",
+                            "hint": "You don't have permission to use this tool.",
+                        })
+                except Exception:
+                    pass
+
+            # Patroclus authorization check.
+            if app_state.patroclus and app_state.patroclus.enabled and user_id:
+                _decision, _reason = await app_state.patroclus.check_access(
+                    agent_id=user_id,
+                    action="call",
+                    resource=f"{connector_name}/{tool_name}",
+                    requested_scopes=[f"{connector_name}:{tool_name}"],
+                )
+                if _decision in ("deny", "require_approval"):
+                    return json.dumps({
+                        "error": "Access denied by Patroclus policy"
+                        if _decision == "deny"
+                        else "Approval required by Patroclus policy",
+                        "reason": _reason,
+                    })
+
+            requires_auth = bool(getattr(tool_def, "requires_auth", False))
+            if requires_auth and not user_token:
+                return json.dumps({
+                    "error": f"No credentials for '{connector_name}'",
+                    "hint": f"Connect your account at /oauth/authorize/{connector_name}",
+                })
+
+        success, result = await app_state.connectors.call_tool(
+            tool_name=tool_name,
+            arguments=call_args,
+            user_token=user_token,
         )
-        if _decision == "deny":
-            return json.dumps({{
-                "error": "Access denied by Patroclus policy",
-                "reason": _reason,
-            }})
-        if _decision == "require_approval":
-            return json.dumps({{
-                "error": "Approval required by Patroclus policy",
-                "reason": _reason,
-            }})
+        if not success:
+            return json.dumps({"error": result})
+        return json.dumps({"result": result})
 
-    requires_auth = {tool_def.requires_auth}
-    if requires_auth and not user_token:
-        return json.dumps({{
-            "error": f"No credentials for '{connector_name}'",
-            "hint": "Connect your account at http://localhost:8000/oauth/authorize/{connector_name}",
-        }})
-
-    success, result = await app_state.connectors.call_tool(
-        tool_name="{tool_name}",
-        arguments=kwargs,
-        user_token=user_token,
+    sig_params = []
+    for pname in param_names:
+        annotation = str if pname in required else Optional[str]
+        default = inspect.Parameter.empty if pname in required else None
+        sig_params.append(
+            inspect.Parameter(pname, inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=annotation, default=default)
+        )
+    sig_params.append(
+        inspect.Parameter("ctx", inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=Optional[Any], default=None)
     )
+    handler.__signature__ = inspect.Signature(sig_params)
+    handler.__name__ = tool_name
+    handler.__doc__ = tool_def.description
+    return handler
 
-    if not success:
-        return json.dumps({{"error": result}})
-    return json.dumps({{"result": result}})
-"""
-        local_ns: Dict[str, Any] = {
-            "app_state": app_state,
-            "json": json,
-            "Optional": Optional,
-            "Context": None,
-        }
-        try:
-            from mcp.server.fastmcp import Context
-            local_ns["Context"] = Context
-        except ImportError:
-            pass
 
-        exec(fn_code, local_ns, local_ns)
-        tool_fn = local_ns["tool_fn"]
-        tool_fn.__name__ = tool_name
-        tool_fn.__doc__ = tool_desc
-
+    for tool_def in tools:
+        tool_fn = _build_mcp_tool_handler(
+            connector_name=connector_name,
+            tool_def=tool_def,
+            app_state=app_state,
+        )
         mcp.tool()(tool_fn)
 
     # Add resources
@@ -3757,70 +3762,12 @@ def create_connector_mcp_server_with_auth(
     # This avoids async event loop issues
 
     for tool_def in tools:
-        tool_name = tool_def.name
-        tool_desc = tool_def.description
-        tool_params = tool_def.parameters
-
-        schema_params = tool_params.get("properties", {})
-        required = tool_params.get("required", [])
-
-        params = []
-        for pname in schema_params:
-            if pname in required:
-                params.append(f"{pname}: str")
-        for pname in schema_params:
-            if pname not in required:
-                params.append(f"{pname}: Optional[str] = None")
-        if params:
-            params_str = ", ".join(params) + ", ctx: Context = None"
-        else:
-            params_str = "ctx: Context = None"
-
-        # Capture user_token in closure
-        _user_token = user_token
-        _connector_name = connector_name
-
-        fn_code = f"""
-async def tool_fn({params_str}) -> str:
-    _tool_param_names = {list(schema_params.keys())}
-    kwargs = {{k: v for k, v in locals().items() if k in _tool_param_names and v is not None}}
-
-    user_token = "{_user_token or ''}"
-    
-    if not user_token:
-        return json.dumps({{
-            "error": f"No credentials for '{_connector_name}'",
-            "hint": "Connect your account at http://localhost:8000/oauth/authorize/{_connector_name}",
-        }})
-
-    success, result = await app_state.connectors.call_tool(
-        tool_name="{tool_name}",
-        arguments=kwargs,
-        user_token=user_token,
-    )
-
-    if not success:
-        return json.dumps({{"error": result}})
-    return json.dumps({{"result": result}})
-"""
-        local_ns: Dict[str, Any] = {
-            "app_state": app_state,
-            "json": json,
-            "Optional": Optional,
-            "Context": None,
-            "asyncio": asyncio,
-        }
-        try:
-            from mcp.server.fastmcp import Context
-            local_ns["Context"] = Context
-        except ImportError:
-            pass
-
-        exec(fn_code, local_ns, local_ns)
-        tool_fn = local_ns["tool_fn"]
-        tool_fn.__name__ = tool_name
-        tool_fn.__doc__ = tool_desc
-
+        tool_fn = _build_mcp_tool_handler(
+            connector_name=connector_name,
+            tool_def=tool_def,
+            app_state=app_state,
+            fixed_user_token=user_token,
+        )
         mcp.tool()(tool_fn)
 
     # Add resources
