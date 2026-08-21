@@ -2,6 +2,10 @@ version: '3.8'
 
 services:
   relay:
+    # In production the deploy workflow pins RELAY_IMAGE to an immutable
+    # ghcr.io/...@sha256:... digest (built, SBOM'd and cosign-signed by CI);
+    # locally this falls back to building the Dockerfile in this repo.
+    image: ${RELAY_IMAGE:-relay-local:build}
     build:
       context: .
       dockerfile: Dockerfile

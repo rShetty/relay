@@ -79,14 +79,114 @@ jobs:
           severity: HIGH,CRITICAL
           exit-code: "1"
 
-  deploy:
+  image:
+    # Build ONCE here — never on the VPS — then promote by immutable digest.
+    # SBOM and signature attach to this exact artifact, so what is verified
+    # is exactly what runs.
     needs: [verify, security]
     runs-on: ubuntu-latest
-    environment: production
+    permissions:
+      contents: read
+      packages: write
+      id-token: write   # required for cosign keyless (Fulcio OIDC) signing
+    outputs:
+      image_digest: ${{ steps.push.outputs.digest }}
+      image_repo: ${{ steps.meta.outputs.repo }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Deploy via SSH
+      # GHCR requires lowercase repository paths; compute once, reuse below.
+      - name: Compute image coordinates
+        id: meta
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          LOWER_OWNER="${OWNER,,}"
+          REPO_NAME="${GITHUB_REPOSITORY#*/}"
+          REPO_NAME="${REPO_NAME,,}"
+          echo "repo=ghcr.io/${LOWER_OWNER}/${REPO_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.repo }}:${{ github.sha }}
+            ${{ steps.meta.outputs.repo }}:latest
+
+      - name: Generate SBOM with syft and upload as workflow artifact
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ steps.meta.outputs.repo }}@${{ steps.push.outputs.digest }}
+          format: spdx-json
+          artifact-name: relay-sbom-${{ github.sha }}.spdx.json
+          upload-artifact: true
+
+      - name: Install cosign
+        id: cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image with cosign (keyless)
+        id: sign
+        # Attempt keyless signing; if the keyless infrastructure is
+        # unavailable we record it and continue (see next step) rather than
+        # silently shipping unsigned.
+        continue-on-error: true
+        env:
+          IMAGE: ${{ steps.meta.outputs.repo }}@${{ steps.push.outputs.digest }}
+        run: |
+          cosign sign --yes "${IMAGE}"
+
+      - name: Record signing outcome
+        if: always()
+        env:
+          SIGN_OUTCOME: ${{ steps.sign.outcome }}
+          IMAGE: ${{ steps.meta.outputs.repo }}@${{ steps.push.outputs.digest }}
+          WORKFLOW_REF: ${{ github.server_url }}/${{ github.repository }}/.github/workflows/deploy.yml@${{ github.ref }}
+        run: |
+          if [ "$SIGN_OUTCOME" = "success" ]; then
+            echo "✅ Image signed with cosign keyless: \`${IMAGE}\`" >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "### ⚠️ Cosign keyless signing unavailable"
+              echo ""
+              echo "Keyless signing did not succeed (Fulcio/Rekor unreachable or"
+              echo "OIDC token rejected). The image was still pushed and SBOM'd,"
+              echo "but it is UNSIGNED. Once keyless works again, verify with:"
+              echo ""
+              echo '```'
+              echo "cosign verify ${IMAGE} \\"
+              echo "  --certificate-identity-regexp='^${WORKFLOW_REF}$' \\"
+              echo "  --certificate-oidc-issuer=https://token.actions.githubusercontent.com"
+              echo '```'
+              echo ""
+              echo "Fallback if keyless remains unavailable: key-based signing"
+              echo "with COSIGN_KEY/COSIGN_PASSWORD repository secrets."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::cosign keyless signing failed — image is unsigned; see job summary"
+          fi
+
+  deploy:
+    needs: [verify, security, image]
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      IMAGE_REPO: ${{ needs.image.outputs.image_repo }}
+      IMAGE_DIGEST: ${{ needs.image.outputs.image_digest }}
+    steps:
+      - name: Deploy promoted image via SSH
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ secrets.VPS_HOST }}
@@ -95,8 +195,12 @@ jobs:
           port: 22
           timeout: 120s
           command_timeout: 30m
+          envs: IMAGE_REPO,IMAGE_DIGEST
           script: |
             set -euo pipefail
+
+            IMAGE="${IMAGE_REPO}@${IMAGE_DIGEST}"
+            echo "Promoting ${IMAGE}"
 
             # ── Secrets from GitHub ──────────────────────────────────
             RELAY_ENCRYPTION_KEY="${{ secrets.RELAY_ENCRYPTION_KEY }}"
@@ -106,7 +210,7 @@ jobs:
             OPENAI_API_KEY="${{ secrets.OPENAI_API_KEY }}"
             SLACK_BOT_TOKEN="${{ secrets.SLACK_BOT_TOKEN }}"
 
-            # ── Clone or update repo ─────────────────────────────────
+            # ── Clone or update repo (config/compose only — NOT a rebuild)
             if [ ! -d /opt/relay/.git ]; then
               rm -rf /opt/relay
               git clone https://github.com/rShetty/relay.git /opt/relay
@@ -143,18 +247,27 @@ jobs:
             mkdir -p /opt/relay/data /opt/relay/logs
             chown -R 1000:1000 /opt/relay/data /opt/relay/logs
 
-            # ── Rebuild and restart Docker containers ────────────────
+            # ── Pull and promote the exact digested image ────────────
+            # No build happens here: RELAY_IMAGE pins the compose service to
+            # the digest produced (SBOM'd, signed) by the `image` job, and
+            # --no-build makes any accidental rebuild impossible.
+            docker pull "${IMAGE}"
+            export RELAY_IMAGE="${IMAGE}"
             cd /opt/relay
             docker compose -f docker-compose.prod.yml down
-            docker compose -f docker-compose.prod.yml build --no-cache
-            docker compose -f docker-compose.prod.yml up -d
+            docker compose -f docker-compose.prod.yml up -d --no-build
 
             # ── Health check with retries ────────────────────────────
             sleep 10
             for i in 1 2 3 4 5 6; do
-              if curl -sf http://127.0.0.1:8000/live; then
+              if curl -sf http://127.0.0.1:8000/live >/dev/null; then
                 echo ""
-                echo "DEPLOY SUCCESS: relay is healthy"
+                if curl -sf http://127.0.0.1:8000/ready; then
+                  echo ""
+                  echo "DEPLOY SUCCESS: relay is live and ready"
+                else
+                  echo "WARNING: relay is live but /ready reports degradation (backing services)"
+                fi
                 exit 0
               fi
               echo "Health check attempt $i failed, waiting..."
@@ -175,15 +288,15 @@ jobs:
           port: 22
           timeout: 120s
           command_timeout: 30m
+          envs: IMAGE_REPO,IMAGE_DIGEST
           script: |
             set -euo pipefail
+            IMAGE="${IMAGE_REPO}@${IMAGE_DIGEST}"
             cd /opt/relay
-            git fetch origin main
-            git reset --hard origin/main
-            git clean -fd
+            docker pull "${IMAGE}"
+            export RELAY_IMAGE="${IMAGE}"
             docker compose -f docker-compose.prod.yml down
-            docker compose -f docker-compose.prod.yml build --no-cache
-            docker compose -f docker-compose.prod.yml up -d
+            docker compose -f docker-compose.prod.yml up -d --no-build
             sleep 10
             curl -sf http://127.0.0.1:8000/live && echo "DEPLOY SUCCESS (retry 1)" || (docker logs relay-app --tail 20 && exit 1)
 
@@ -197,8 +310,11 @@ jobs:
           port: 22
           timeout: 120s
           command_timeout: 30m
+          envs: IMAGE_REPO,IMAGE_DIGEST
           script: |
             set -euo pipefail
+            IMAGE="${IMAGE_REPO}@${IMAGE_DIGEST}"
+            export RELAY_IMAGE="${IMAGE}"
             cd /opt/relay
             docker compose -f docker-compose.prod.yml restart
             sleep 10

@@ -115,19 +115,60 @@ scaling as the only option.
 | 20 | No dependency scanning | Added pip-audit + Trivy to CI |
 | 21 | Missing Helm charts | Created `deploy/kubernetes/relay/` with Chart.yaml, values.yaml, templates |
 | 22 | Dockerfile `as` lowercase | Fixed to `AS`; added `PYTHONUNBUFFERED`, `PYTHONDONTWRITEBYTECODE` |
+| 23 | Deploy rebuilt from source on the VPS; no SBOM or image signing | Build-once artifact promotion: CI builds/pushes a digest-pinned GHCR image, generates a syft SBOM, attempts cosign keyless signing, and the VPS pulls that exact digest with `--no-build`. See [Artifact Promotion](#artifact-promotion--supply-chain) below |
 
 ### Enterprise Features Added
 
 | # | Feature | Implementation |
 |---|---------|---------------|
-| 23 | Account lockout | Configurable max attempts + lockout duration |
-| 24 | GDPR right-to-erasure | `DELETE /auth/me` + `db.delete_user()` with cascading cleanup |
-| 25 | JWKS endpoint | `/oauth/jwks` for RS256 public key distribution |
-| 26 | SSO/OIDC config | `OAuthSettings.sso_*` fields for Okta/Azure AD integration |
-| 27 | Tamper-evident audit logs | Hash-chained entries in `AuditLogger` |
-| 28 | Security headers | CSP, X-Frame-Options, X-Content-Type-Options via `SecurityHeadersMiddleware` |
-| 29 | CSRF protection | `CSRFMiddleware` with double-submit cookie pattern |
-| 30 | Insecure-cookie escape hatch reachable in production | `RELAY_ALLOW_INSECURE_COOKIES=true` now fails config validation when `RELAY_ENVIRONMENT=production`; `docker-compose.prod.yml` pins the variable to `false`. `/ready` deep-probes SQLite openability (`SELECT 1`) and Redis ping (when configured) so the probe reflects backing services |
+| 24 | Account lockout | Configurable max attempts + lockout duration |
+| 25 | GDPR right-to-erasure | `DELETE /auth/me` + `db.delete_user()` with cascading cleanup |
+| 26 | JWKS endpoint | `/oauth/jwks` for RS256 public key distribution |
+| 27 | SSO/OIDC config | `OAuthSettings.sso_*` fields for Okta/Azure AD integration |
+| 28 | Tamper-evident audit logs | Hash-chained entries in `AuditLogger` |
+| 29 | Security headers | CSP, X-Frame-Options, X-Content-Type-Options via `SecurityHeadersMiddleware` |
+| 30 | CSRF protection | `CSRFMiddleware` with double-submit cookie pattern |
+| 31 | Insecure-cookie escape hatch reachable in production | `RELAY_ALLOW_INSECURE_COOKIES=true` now fails config validation when `RELAY_ENVIRONMENT=production`; `docker-compose.prod.yml` pins the variable to `false`. `/ready` deep-probes SQLite openability (`SELECT 1`) and Redis ping (when configured) so the probe reflects backing services |
+
+## Artifact Promotion & Supply Chain
+
+The deploy pipeline follows a **build-once, promote-by-digest** model
+(`.github/workflows/deploy.yml`):
+
+1. **Build** — the `image` job builds the Docker image once in CI and pushes
+   it to GHCR tagged with the commit SHA and `latest`.
+2. **SBOM** — [syft](https://github.com/anchore/sbom-action) generates an
+   SPDX JSON SBOM of the *pushed image digest* and uploads it as a workflow
+   artifact (`relay-sbom-<sha>.spdx.json`).
+3. **Sign** — [cosign](https://github.com/sigstore/cosign) attempts **keyless**
+   signing (Fulcio certificate via the workflow's OIDC token, logged in
+   Rekor). If keyless infrastructure is unavailable the job records the
+   failure in the run summary and marks the image **unsigned** rather than
+   blocking the release; the documented fallback is key-based signing with
+   `COSIGN_KEY`/`COSIGN_PASSWORD` repository secrets.
+4. **Promote** — the `deploy` job passes `repo@sha256:...` to the VPS over
+   SSH. The VPS **pulls the exact digest** and runs
+   `docker compose up -d --no-build` (`RELAY_IMAGE` pins the compose service).
+   Nothing is rebuilt on the VPS, so the artifact that was scanned and signed
+   is bit-for-bit what runs in production.
+
+### Verification (after a signed deploy)
+
+```bash
+cosign verify ghcr.io/<owner>/<repo>@sha256:<digest> \
+  --certificate-identity-regexp '^https://github.com/<owner>/<repo>/\.github/workflows/deploy\.yml@refs/heads/main$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+### Planned hardening (future iterations)
+
+- Admission control on the VPS: refuse to start the relay service unless
+  `cosign verify` succeeds against the promoted digest (requires keyless or
+  a distributed public key).
+- Attach the SBOM to the image itself (`cosign attach`) and store signatures
+  in an OCI registry or transparency log for long-term retention.
+- Provenance attestation (`cosign attest` with SLSA provenance) alongside the
+  signature.
 
 ## What Belongs to Ecosystem Products
 
