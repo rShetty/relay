@@ -596,6 +596,22 @@ class TestFastAPIEndpoints:
         import gateway.server as server_module
         return TestClient(server_module.app, raise_server_exceptions=False)
 
+    def _register_and_login(self, client, username: str):
+        """Register (idempotent) and log in a user, storing the session cookie."""
+        from auth import database as db
+        db.init_db()  # TestClient skips lifespan, so ensure schema exists
+        reg = client.post(
+            "/auth/register",
+            json={"username": username, "password": "test-password-123"},
+        )
+        assert reg.status_code in (200, 409), reg.text  # 409 = already exists
+        login = client.post(
+            "/auth/login",
+            json={"username": username, "password": "test-password-123"},
+        )
+        assert login.status_code == 200, login.text
+        return login.json()
+
     def test_health_returns_200(self):
         resp = self._client().get("/health")
         assert resp.status_code == 200
@@ -604,11 +620,11 @@ class TestFastAPIEndpoints:
         assert "backends" in body
         assert "circuit_open" in body["backends"]
 
-    def test_root_returns_200(self):
-        resp = self._client().get("/")
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body["status"] == "running"
+    def test_root_redirects_based_on_session(self):
+        """Root path redirects to /app (logged in) or /auth/login (anonymous)."""
+        resp = self._client().get("/", follow_redirects=False)
+        assert resp.status_code in (301, 302, 303, 307, 308)
+        assert "/auth/login" in resp.headers.get("location", "")
 
     def test_register_client_returns_client_id(self):
         resp = self._client().post(
@@ -669,10 +685,11 @@ class TestFastAPIEndpoints:
         assert "Maximum 10" in resp.json()["error"]
 
     def test_complete_oauth_flow_and_call(self):
-        """Register client → PKCE → auth code → token → validate."""
+        """Register client → PKCE → session login → auth code → token → validate."""
         from auth.oauth import generate_code_challenge, generate_code_verifier
 
         client = self._client()
+        self._register_and_login(client, "oauth_e2e_user")
 
         # 1. Register
         reg = client.post(
@@ -685,7 +702,7 @@ class TestFastAPIEndpoints:
         verifier = generate_code_verifier()
         challenge = generate_code_challenge(verifier)
 
-        # 3. Auth code
+        # 3. Auth code (requires an authenticated session)
         auth_resp = client.get(
             "/oauth/authorize",
             params={
@@ -695,8 +712,9 @@ class TestFastAPIEndpoints:
                 "code_challenge_method": "S256",
                 "scope": "mcp:tools",
             },
-        ).json()
-        code = auth_resp["code"]
+        )
+        assert auth_resp.status_code == 200, auth_resp.text
+        code = auth_resp.json()["code"]
 
         # 4. Exchange
         token_resp = client.post(
@@ -717,6 +735,7 @@ class TestFastAPIEndpoints:
         from auth.oauth import generate_code_challenge, generate_code_verifier
 
         client = self._client()
+        self._register_and_login(client, "oauth_refresh_user")
 
         reg = client.post(
             "/oauth/register",
@@ -727,7 +746,7 @@ class TestFastAPIEndpoints:
         verifier = generate_code_verifier()
         challenge = generate_code_challenge(verifier)
 
-        code = client.get(
+        auth_resp = client.get(
             "/oauth/authorize",
             params={
                 "client_id": cid,
@@ -736,7 +755,9 @@ class TestFastAPIEndpoints:
                 "code_challenge_method": "S256",
                 "scope": "mcp:tools",
             },
-        ).json()["code"]
+        )
+        assert auth_resp.status_code == 200, auth_resp.text
+        code = auth_resp.json()["code"]
 
         tokens = client.post(
             "/oauth/token",

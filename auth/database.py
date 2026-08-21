@@ -221,7 +221,7 @@ def init_db() -> sqlite3.Connection:
     
     conn.commit()
     logger.info(f"Database initialized at {get_db_path()}")
-    
+    conn.close()
     return conn
 
 
