@@ -129,6 +129,14 @@ class SecuritySettings(BaseSettings):
         "password", "token", "secret", "key", "credential", "api_key"
     ])
 
+    # Audit log rotation & retention
+    # Max size of a single audit file before rotation (default 100 MB)
+    audit_log_max_bytes: int = 100 * 1024 * 1024
+    # Number of rotated files to keep (audit.log.1 .. audit.log.N)
+    audit_log_max_files: int = 10
+    # Delete rotated files older than this many days (None = keep until rotated out)
+    audit_log_retention_days: Optional[int] = None
+
     # IP restrictions
     ip_whitelist: List[str] = Field(default_factory=list)
     ip_blacklist: List[str] = Field(default_factory=list)

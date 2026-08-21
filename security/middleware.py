@@ -407,6 +407,9 @@ class AuditLogger:
         self.max_files = max_files
         self.retention_days = retention_days
         self._last_hash: str = ""
+        # Serializes rotation + append so concurrent events cannot interleave
+        # mid-shift and write into a file that is being renamed.
+        self._lock = threading.Lock()
         self._ensure_log_directory()
         self._prune_expired_rotations()
         self._load_last_hash()
@@ -490,9 +493,11 @@ class AuditLogger:
 
         # Log to file (with size-based rotation)
         try:
-            self._rotate_if_needed()
-            with open(self.log_path, "a") as f:
-                f.write(final_entry + "\n")
+            with self._lock:
+                self._rotate_if_needed()
+                self._prune_expired_rotations()
+                with open(self.log_path, "a") as f:
+                    f.write(final_entry + "\n")
         except Exception as e:
             logger.error(f"Failed to write audit log: {e}")
 
@@ -528,8 +533,7 @@ class AuditLogger:
         if not self.retention_days:
             return
         try:
-            import time as _time
-            cutoff = _time.time() - self.retention_days * 86400
+            cutoff = time.time() - self.retention_days * 86400
             directory = os.path.dirname(self.log_path) or "."
             base = os.path.basename(self.log_path)
             for name in os.listdir(directory):

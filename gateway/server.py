@@ -261,6 +261,9 @@ def _create_app_state_sync(config: RelayConfig) -> AppState:
         log_path=config.security.audit_log_path,
         enabled=config.security.audit_enabled,
         sensitive_fields=config.security.audit_sensitive_fields,
+        max_bytes=config.security.audit_log_max_bytes,
+        max_files=config.security.audit_log_max_files,
+        retention_days=config.security.audit_log_retention_days,
     )
     security = SecurityContext(
         rate_limiter=RateLimiter(
@@ -432,6 +435,9 @@ async def lifespan(app: FastAPI):
         log_path=config.security.audit_log_path,
         enabled=config.security.audit_enabled,
         sensitive_fields=config.security.audit_sensitive_fields,
+        max_bytes=config.security.audit_log_max_bytes,
+        max_files=config.security.audit_log_max_files,
+        retention_days=config.security.audit_log_retention_days,
     )
     security = SecurityContext(
         rate_limiter=RateLimiter(
