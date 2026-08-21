@@ -3,6 +3,75 @@
 This document tracks the improvements made to make Relay production/enterprise-ready,
 and identifies which items belong to Relay vs. the broader ecosystem.
 
+## High Availability — Honest Assessment
+
+**Relay today is a single-node deployment. Running more than one replica against the
+current codebase does not give you high availability — it gives you silent
+inconsistency between replicas.** This section describes exactly what breaks and what
+a real HA topology requires.
+
+### What breaks today with >1 replica
+
+| Component | State | Why multiple replicas break it |
+|-----------|-------|-------------------------------|
+| Gateway database (`auth/database.py`) | SQLite via stdlib `sqlite3` | Every replica would open its own `data/gateway.db` file. Users registered on replica A do not exist on replica B; API keys, OAuth clients, consents, and installed backends diverge silently. |
+| Rate limiter (`security/middleware.py::RateLimiter`) | Per-process sliding window | `configure_redis()` stores a Redis client, but `is_allowed()` never consults it — counting happens only in local memory. With N replicas each client effectively gets N× the configured request budget. |
+| Account lockout (`app_state._login_attempts`) | Per-process dict | Failed-login counters are not shared, so lockout thresholds must be exceeded against every replica independently. |
+| JWT revocation (`auth/oauth.py::JWTManager`) | In-memory + Redis (shared) | The one component that *is* cluster-safe when `RELAY_DATABASE__REDIS_URL` is set. Caveat: `is_revoked()` fails **open** if Redis errors — a revoked token may be accepted during a Redis outage on any replica that has not seen the jti locally. |
+| Connector registry / backend sessions (`connectors/__init__.py`, `backends/manager.py`) | Process-local singletons | Health-check state, MCP stdio sessions, and enabled-flags live per process. A tool call routed to replica B can hit a backend session replica B never opened or believes is unhealthy. |
+| Connector OAuth token cache (`auth/oauth_providers.py::_tokens`) | Per-process cache | After connecting GitHub on replica A, replica B cannot see the cached credential until it is written through `get_token_store()` (SQLite). |
+| Audit log (`AuditLogger`) | Local hash-chained file | Each replica chains events into its own `logs/audit.log`; the tamper-evident hash chain is per-file and cannot be verified across replicas. |
+| Login rate limiting / CSRF double-submit cookies | Per-process / per-replica secrets unless synced | Double-submit CSRF tokens are signed with `RELAY_SECURITY__CSRF_SECRET_KEY` — this works across replicas **only if** every replica uses identical secret values from shared config. |
+
+### Recommended topology (target state)
+
+Not achievable with current code until the migration items below land:
+
+```
+                      ┌─────────────────────────────────────────┐
+                      │            Load balancer (TLS)          │
+                      └────────────────────┬────────────────────┘
+                                           │
+              ┌────────────────────────────┼────────────────────────────┐
+              ▼                            ▼                            ▼
+     ┌────────────────┐          ┌────────────────┐          ┌────────────────┐
+     │  relay app #1  │          │  relay app #2  │          │  relay app #N  │
+     │  (stateless*)  │          │  (stateless*)  │          │  (stateless*)  │
+     └───────┬────────┘          └───────┬────────┘          └───────┬────────┘
+             │      (*after Postgres + shared-state work)│           │
+             └──────────────┬────────────┴──────────────┬───────────┘
+                            ▼                           ▼
+                 ┌────────────────────┐       ┌────────────────────┐
+                 │  PostgreSQL        │       │  Redis             │
+                 │  (users, keys,     │       │  (rate limits*,    │
+                 │  OAuth, audit)     │       │   JWT revocation)  │
+                 └────────────────────┘       └────────────────────┘
+```
+
+\* Rate-limit sharing requires fixing `RateLimiter.is_allowed()` to actually consult
+Redis; today Redis is connected but unused by the limiter.
+
+### Migration requirements before HA
+
+1. **PostgreSQL** — `DatabaseSettings.url` accepts a Postgres DSN, but no runtime code
+   consumes it: all persistence goes through stdlib `sqlite3`. An async SQLAlchemy
+   engine layer must replace the raw sqlite3 calls (drivers already declared in the
+   optional `postgres` extra).
+2. **Schema migrations** — Tables are created with `CREATE TABLE IF NOT EXISTS`
+   (`init_db()`); Alembic (or equivalent) is required before multi-replica rollouts so
+   concurrent boots do not fight over schema.
+3. **Redis-backed rate limiting** — Make `RateLimiter` use atomic Redis window
+   operations (`INCR`/`EXPIRE` or a Lua script) instead of local lists.
+4. **Shared lockout & revocation semantics** — Move `_login_attempts` to Redis; decide
+   whether JWT-revocation fail-open behaviour is acceptable or should fail closed.
+5. **Session affinity elimination** — Ensure connector/backend session state is either
+   externalized or safe to rebuild lazily on any replica.
+6. **Centralized audit sink** — Ship audit events to shared storage (DB/SIEM) instead of
+   per-pod files so the hash chain remains verifiable.
+
+Until items 1–3 are complete, run **exactly one** relay replica and treat vertical
+scaling as the only option.
+
 ## What Was Fixed in Relay
 
 ### Critical Security Fixes
@@ -112,13 +181,14 @@ Relay's role: Accept authenticated requests from Hive agents. Already supported 
 
 1. **Alembic migrations** — Replace `CREATE TABLE IF NOT EXISTS` with proper migration system
 2. **PostgreSQL async engine** — Implement async SQLAlchemy engine when `DATABASE_URL` is PostgreSQL
-3. **SSO implementation** — Wire OIDC callback flow (config exists, handler not implemented)
-4. **Webhook/event system** — Notify external systems of events
-5. **Per-tenant quotas** — Usage limits per organization
-6. **Multi-tenancy / org layer** — Organization/team/tenant isolation
-7. **Feature flags** — Toggle connectors/features per environment
-8. **Backup/restore tooling** — Scripts and documentation for DR
-9. **Sentiel DLP integration** — Send tool call results to Sentiel for inspection
+3. **Redis-backed rate limiting** — Make `RateLimiter.is_allowed()` consult Redis atomically (currently connected but unused; see [High Availability](#high-availability--honest-assessment))
+4. **SSO implementation** — Wire OIDC callback flow (config exists, handler not implemented)
+5. **Webhook/event system** — Notify external systems of events
+6. **Per-tenant quotas** — Usage limits per organization
+7. **Multi-tenancy / org layer** — Organization/team/tenant isolation
+8. **Feature flags** — Toggle connectors/features per environment
+9. **Backup/restore tooling** — Scripts and documentation for DR
+10. **Sentiel DLP integration** — Send tool call results to Sentiel for inspection
 
 ### In Ecosystem
 
