@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import secrets
+import sqlite3
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -148,6 +149,37 @@ def _get_state() -> AppState:
         from fastapi import HTTPException
         raise HTTPException(status_code=503, detail="Server not ready")
     return state
+
+
+def _cookie_secure(config: RelayConfig) -> bool:
+    """
+    Whether cookies must carry the ``Secure`` attribute.
+
+    Cookies are always Secure unless RELAY_ALLOW_INSECURE_COOKIES=true was
+    explicitly set — and that escape hatch is rejected outright in production
+    (see RelayConfig.enforce_secure_cookies_in_production), so this only ever
+    returns False for local development over plain HTTP.
+    """
+    return not config.allow_insecure_cookies
+
+
+def _sqlite_db_path(app_state: "AppState") -> Optional[str]:
+    """
+    Resolve the SQLite database file to probe for the readiness check.
+
+    Returns ``None`` when a non-SQLite ``RELAY_DATABASE__URL`` is configured,
+    in which case there is no database file to open-probe. Otherwise this
+    resolves the exact path ``auth/database.py`` uses at runtime (including
+    the ``MCP_GATEWAY_DB_PATH`` override).
+    """
+    url = app_state.config.database.url
+    if url and not url.startswith("sqlite"):
+        return None
+    from auth import database as auth_db
+    try:
+        return str(auth_db.get_db_path())
+    except Exception:  # pragma: no cover - defensive fallback
+        return app_state.config.database.sqlite_path
 
 
 def _create_app_state_sync(config: RelayConfig) -> AppState:
@@ -806,7 +838,7 @@ async def authorize_page(
         value=csrf_token,
         httponly=False,
         samesite="lax" if not app_state.config.is_production else "strict",
-        secure=not app_state.config.allow_insecure_cookies,
+        secure=_cookie_secure(app_state.config),
         path="/",
     )
     return response
@@ -1220,7 +1252,7 @@ async def login_user(req: UserLoginRequest, response: Response, request: Request
         key="session",
         value=session_token,
         httponly=True,
-        secure=is_prod,
+        secure=_cookie_secure(app_state.config),
         samesite="strict" if is_prod else "lax",
         max_age=86400,
         path="/",
@@ -2144,8 +2176,22 @@ async def liveness():
 
 @app.get("/ready", tags=["Info"])
 async def readiness():
-    """Readiness probe — all backends connected and healthy."""
+    """
+    Readiness probe — backends plus backing services.
+
+    Deep checks:
+    - SQLite: the gateway database can be opened and queried
+    - Redis: pinged only when RELAY_DATABASE__REDIS_URL is configured;
+      when not configured it is reported as not-applicable (ok)
+    - Backends: at least one healthy backend unless none are registered
+
+    Returns 200 with ``ready: true`` only when every applicable check passes,
+    503 with a ``degraded`` list naming the failing checks otherwise.
+    """
     app_state = _get_state()
+    checks: Dict[str, Dict[str, Any]] = {}
+
+    # --- Backends ---------------------------------------------------------
     backends_info = app_state.backends.list_backends()
     backends_healthy = sum(1 for b in backends_info if b["status"] == "healthy")
     backends_total = len(backends_info)
@@ -2153,18 +2199,63 @@ async def readiness():
         1 for b in backends_info
         if b.get("circuit_breaker", {}).get("state") == "open"
     )
+    checks["backends"] = {
+        "ok": backends_total == 0 or (backends_healthy > 0 and circuit_open == 0),
+        "healthy": backends_healthy,
+        "total": backends_total,
+        "circuit_open": circuit_open,
+    }
 
-    ready = backends_total == 0 or (backends_healthy > 0 and circuit_open == 0)
+    # --- SQLite openability ----------------------------------------------
+    # Skipped (reported ok) when a non-SQLite RELAY_DATABASE__URL is set and
+    # there is no database file to open-probe.
+    db_path = _sqlite_db_path(app_state)
+    sqlite_error: Optional[str] = None
+    if db_path is not None:
+        try:
+            conn = sqlite3.connect(db_path, timeout=2)
+            try:
+                conn.execute("SELECT 1")
+            finally:
+                conn.close()
+        except sqlite3.Error as exc:
+            sqlite_error = str(exc) or type(exc).__name__
+    sqlite_check: Dict[str, Any] = {"ok": sqlite_error is None}
+    if db_path is None:
+        sqlite_check["skipped"] = "non-sqlite database URL configured"
+    if sqlite_error is not None:
+        sqlite_check["error"] = sqlite_error
+    checks["sqlite"] = sqlite_check
+
+    # --- Redis ping (only when configured) --------------------------------
+    redis_url = app_state.config.database.redis_url
+    redis_check: Dict[str, Any] = {"configured": bool(redis_url), "ok": True}
+    if redis_url:
+        redis_error: Optional[str] = None
+        try:
+            import redis as redis_lib
+            client = redis_lib.from_url(
+                redis_url,
+                decode_responses=True,
+                socket_connect_timeout=2,
+                socket_timeout=2,
+            )
+            client.ping()
+        except Exception as exc:  # noqa: BLE001 — any failure means "not ready"
+            redis_error = str(exc) or type(exc).__name__
+        redis_check["ok"] = redis_error is None
+        if redis_error is not None:
+            redis_check["error"] = redis_error
+    checks["redis"] = redis_check
+
+    ready = all(check["ok"] for check in checks.values())
+    degraded = [name for name, check in checks.items() if not check["ok"]]
+    content: Dict[str, Any] = {"ready": ready, "checks": checks}
+    if degraded:
+        content["degraded"] = degraded
     return JSONResponse(
         status_code=200 if ready else 503,
-        content={
-            "ready": ready,
-            "backends": {
-                "healthy": backends_healthy,
-                "total": backends_total,
-                "circuit_open": circuit_open,
-            },
-        },
+        content=content,
     )
 
 

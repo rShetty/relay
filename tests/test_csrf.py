@@ -44,11 +44,11 @@ def _build_app():
 
 @pytest.fixture()
 def client():
-    return TestClient(_build_app())
+    return TestClient(_build_app(), base_url="https://testserver")
 
 
 def _post(client, path, **kwargs):
-    return client.post(f"http://testserver{path}", **kwargs)
+    return client.post(f"https://testserver{path}", **kwargs)
 
 
 class TestSafeMethods:
@@ -57,16 +57,16 @@ class TestSafeMethods:
         assert resp.status_code == 405  # GET not routed; reached router, not CSRF block
 
     def test_get_seeds_csrf_cookie(self, client):
-        resp = client.get("http://testserver/form/submit")
+        resp = client.get("https://testserver/form/submit")
         assert resp.status_code == 405
         assert "csrf_token" in resp.cookies
 
     def test_head_and_options_pass(self, client):
-        assert client.options("http://testserver/form/submit").status_code != 403
+        assert client.options("https://testserver/form/submit").status_code != 403
 
 
 def _post_safe(client, method, path):
-    return client.request(method, f"http://testserver{path}")
+    return client.request(method, f"https://testserver{path}")
 
 
 class TestExemptPrefixes:
@@ -141,7 +141,7 @@ class TestFormPostValidation:
 class TestEndToEndWithSeededCookie:
     def test_flow_get_seed_then_post_with_header(self, client):
         # Step 1: any safe request seeds the double-submit cookie.
-        seed = client.get("http://testserver/v1/tools")
+        seed = client.get("https://testserver/v1/tools")
         token = seed.cookies["csrf_token"]
 
         # Step 2: non-exempt form post must present the same token.

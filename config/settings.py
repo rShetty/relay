@@ -10,7 +10,7 @@ import os
 import secrets
 from typing import Any, Dict, List, Optional
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -272,6 +272,17 @@ class RelayConfig(BaseSettings):
         if v not in allowed:
             raise ValueError(f"environment must be one of {allowed}")
         return v
+
+    @model_validator(mode="after")
+    def enforce_secure_cookies_in_production(self) -> "RelayConfig":
+        """Fail fast if the insecure-cookie escape hatch is used in production."""
+        if self.environment == "production" and self.allow_insecure_cookies:
+            raise ValueError(
+                "RELAY_ALLOW_INSECURE_COOKIES=true is forbidden when "
+                "RELAY_ENVIRONMENT=production: session cookies must be marked "
+                "Secure. Use a development environment for local HTTP testing."
+            )
+        return self
 
     @field_validator("oauth")
     @classmethod

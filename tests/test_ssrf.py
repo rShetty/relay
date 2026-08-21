@@ -194,7 +194,7 @@ def _make_admin_client():
     )
 
     db.init_db()
-    client = TestClient(server_module.app, raise_server_exceptions=False)
+    client = TestClient(server_module.app, base_url="https://testserver", raise_server_exceptions=False)
 
     r = client.post(
         "/auth/register", json={"username": "ssrf_admin", "password": "test-password-123"}

@@ -519,7 +519,7 @@ class TestRequestIDMiddleware:
         mock_state.backends.list_backends.return_value = []
         server_module.state = mock_state
 
-        return TestClient(server_module.app, raise_server_exceptions=False)
+        return TestClient(server_module.app, base_url="https://testserver", raise_server_exceptions=False)
 
     def test_response_contains_request_id(self):
         client = self._client()
@@ -594,7 +594,7 @@ class TestFastAPIEndpoints:
     def _client(self):
         from fastapi.testclient import TestClient
         import gateway.server as server_module
-        return TestClient(server_module.app, raise_server_exceptions=False)
+        return TestClient(server_module.app, base_url="https://testserver", raise_server_exceptions=False)
 
     def _register_and_login(self, client, username: str):
         """Register (idempotent) and log in a user, storing the session cookie."""
@@ -1074,7 +1074,7 @@ class TestUserAuth:
     def test_register_success(self):
         from fastapi.testclient import TestClient
         import gateway.server as server_module
-        client = TestClient(server_module.app, raise_server_exceptions=False)
+        client = TestClient(server_module.app, base_url="https://testserver", raise_server_exceptions=False)
 
         resp = self._register_user(client, "newuser", "TestPass123")
         assert resp.status_code == 200
@@ -1085,7 +1085,7 @@ class TestUserAuth:
     def test_register_duplicate_username(self):
         from fastapi.testclient import TestClient
         import gateway.server as server_module
-        client = TestClient(server_module.app, raise_server_exceptions=False)
+        client = TestClient(server_module.app, base_url="https://testserver", raise_server_exceptions=False)
 
         self._register_user(client, "dupuser", "TestPass123")
         resp = self._register_user(client, "dupuser", "OtherPass456")
@@ -1094,7 +1094,7 @@ class TestUserAuth:
     def test_register_short_password(self):
         from fastapi.testclient import TestClient
         import gateway.server as server_module
-        client = TestClient(server_module.app, raise_server_exceptions=False)
+        client = TestClient(server_module.app, base_url="https://testserver", raise_server_exceptions=False)
 
         resp = self._register_user(client, "shortpw", "abc")
         assert resp.status_code == 400
@@ -1102,7 +1102,7 @@ class TestUserAuth:
     def test_register_short_username(self):
         from fastapi.testclient import TestClient
         import gateway.server as server_module
-        client = TestClient(server_module.app, raise_server_exceptions=False)
+        client = TestClient(server_module.app, base_url="https://testserver", raise_server_exceptions=False)
 
         resp = self._register_user(client, "ab", "TestPass123")
         assert resp.status_code == 400
@@ -1134,7 +1134,7 @@ class TestUserAuth:
             security=security, backends=backends, connectors=connectors,
         )
 
-        client = TestClient(server_module.app, raise_server_exceptions=False)
+        client = TestClient(server_module.app, base_url="https://testserver", raise_server_exceptions=False)
         self._register_user(client, "loginuser", "TestPass123")
         resp = self._login_user(client, "loginuser", "TestPass123")
         assert resp.status_code == 200
@@ -1169,7 +1169,7 @@ class TestUserAuth:
             security=security, backends=backends, connectors=connectors,
         )
 
-        client = TestClient(server_module.app, raise_server_exceptions=False)
+        client = TestClient(server_module.app, base_url="https://testserver", raise_server_exceptions=False)
         self._register_user(client, "wrongpw", "TestPass123")
         resp = self._login_user(client, "wrongpw", "WrongPass456")
         assert resp.status_code == 401
@@ -1203,7 +1203,7 @@ class TestUserAuth:
             security=security, backends=backends, connectors=connectors,
         )
 
-        client = TestClient(server_module.app, raise_server_exceptions=False)
+        client = TestClient(server_module.app, base_url="https://testserver", raise_server_exceptions=False)
         resp = self._login_user(client, "nobody", "TestPass123")
         assert resp.status_code == 401
 
@@ -1236,7 +1236,7 @@ class TestUserAuth:
             security=security, backends=backends, connectors=connectors,
         )
 
-        client = TestClient(server_module.app, raise_server_exceptions=False)
+        client = TestClient(server_module.app, base_url="https://testserver", raise_server_exceptions=False)
         self._register_user(client, "meme", "TestPass123", "meme@test.com")
         self._login_user(client, "meme", "TestPass123")
         resp = client.get("/auth/me")
@@ -1250,7 +1250,7 @@ class TestUserAuth:
     def test_get_me_without_session(self):
         from fastapi.testclient import TestClient
         import gateway.server as server_module
-        client = TestClient(server_module.app, raise_server_exceptions=False)
+        client = TestClient(server_module.app, base_url="https://testserver", raise_server_exceptions=False)
 
         resp = client.get("/auth/me")
         assert resp.status_code == 401
@@ -1258,7 +1258,7 @@ class TestUserAuth:
     def test_dashboard_redirects_without_session(self):
         from fastapi.testclient import TestClient
         import gateway.server as server_module
-        client = TestClient(server_module.app, raise_server_exceptions=False)
+        client = TestClient(server_module.app, base_url="https://testserver", raise_server_exceptions=False)
 
         resp = client.get("/app", follow_redirects=False)
         assert resp.status_code == 307
@@ -1291,7 +1291,7 @@ class TestUserAuth:
             security=security, backends=backends, connectors=connectors,
         )
 
-        client = TestClient(server_module.app, raise_server_exceptions=False)
+        client = TestClient(server_module.app, base_url="https://testserver", raise_server_exceptions=False)
         self._register_user(client, "dashuser", "TestPass123")
         self._login_user(client, "dashuser", "TestPass123")
         resp = client.get("/app")
@@ -1303,7 +1303,7 @@ class TestUserAuth:
     def test_logout_clears_session(self):
         from fastapi.testclient import TestClient
         import gateway.server as server_module
-        client = TestClient(server_module.app, raise_server_exceptions=False)
+        client = TestClient(server_module.app, base_url="https://testserver", raise_server_exceptions=False)
 
         self._register_user(client, "logoutuser", "TestPass123")
         self._login_user(client, "logoutuser", "TestPass123")

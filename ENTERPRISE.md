@@ -127,6 +127,7 @@ scaling as the only option.
 | 27 | Tamper-evident audit logs | Hash-chained entries in `AuditLogger` |
 | 28 | Security headers | CSP, X-Frame-Options, X-Content-Type-Options via `SecurityHeadersMiddleware` |
 | 29 | CSRF protection | `CSRFMiddleware` with double-submit cookie pattern |
+| 30 | Insecure-cookie escape hatch reachable in production | `RELAY_ALLOW_INSECURE_COOKIES=true` now fails config validation when `RELAY_ENVIRONMENT=production`; `docker-compose.prod.yml` pins the variable to `false`. `/ready` deep-probes SQLite openability (`SELECT 1`) and Redis ping (when configured) so the probe reflects backing services |
 
 ## What Belongs to Ecosystem Products
 

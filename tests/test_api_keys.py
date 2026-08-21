@@ -41,7 +41,7 @@ def _make_client():
         backends=BackendManager(),
         connectors=ConnectorRegistry(),
     )
-    return TestClient(server_module.app, raise_server_exceptions=False)
+    return TestClient(server_module.app, base_url="https://testserver", raise_server_exceptions=False)
 
 
 def _register_and_login(client, username):

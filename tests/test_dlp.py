@@ -189,7 +189,7 @@ def _make_client(dlp_enabled=True, backend_result=None):
         backends=backends,
         connectors=ConnectorRegistry(),
     )
-    return TestClient(server_module.app, raise_server_exceptions=False)
+    return TestClient(server_module.app, base_url="https://testserver", raise_server_exceptions=False)
 
 
 def _mint_key(client, username):

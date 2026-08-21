@@ -10,6 +10,13 @@ services:
       - "127.0.0.1:8000:8000"
     env_file:
       - .env
+    environment:
+      # Secure cookies are mandatory in production. The variable is pinned
+      # "false" so an operator's .env cannot relax it, and config/settings.py
+      # additionally refuses to boot with RELAY_ALLOW_INSECURE_COOKIES=true
+      # when RELAY_ENVIRONMENT=production (fail-fast backstop).
+      RELAY_ENVIRONMENT: production
+      RELAY_ALLOW_INSECURE_COOKIES: "false"
     volumes:
       - ./logs:/app/logs
       - ./data:/app/data
