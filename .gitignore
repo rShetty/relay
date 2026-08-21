@@ -77,3 +77,11 @@ htmlcov/
 .mcp.json
 .opencode/
 opencode.json
+
+# Runtime artifacts and credentials
+/data/
+/logs/
+*.key
+cookies.txt
+.venv*/
+venv/
