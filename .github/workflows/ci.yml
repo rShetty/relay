@@ -34,10 +34,10 @@ jobs:
         run: black --check --diff . || black .
 
       - name: Type check with mypy
-        run: mypy --ignore-missing-imports gateway/ auth/ security/ config/ || true
+        run: mypy --ignore-missing-imports gateway/ auth/ security/ config/
 
       - name: Test with pytest
-        run: pytest tests/ -v --cov=. --cov-report=xml --cov-report=term || true
+        run: pytest tests/ -v --cov=. --cov-report=xml --cov-report=term
 
       - name: Upload coverage
         if: matrix.python-version == '3.12'
@@ -68,7 +68,7 @@ jobs:
           scan-type: fs
           scan-ref: .
           severity: CRITICAL,HIGH
-          exit-code: "0"
+          exit-code: "1"
 
   docker:
     runs-on: ubuntu-latest
@@ -85,4 +85,4 @@ jobs:
         with:
           image-ref: relay:ci
           severity: CRITICAL,HIGH
-          exit-code: "0"
+          exit-code: "1"
