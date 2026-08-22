@@ -803,7 +803,25 @@ def _verify_consent_csrf(request: Request, submitted_token: Optional[str]) -> bo
     if not cookie_token or not submitted_token:
         return False
     import hmac
+    if len(cookie_token) > 128:
+        # Absurd length: treat as an injection attempt rather than echoing
+        # attacker-controlled data into a Set-Cookie header later on.
+        return False
     return hmac.compare_digest(cookie_token, submitted_token)
+
+
+def _safe_redirect_target(redirect_uri: str, client) -> str:
+    """Return the registered redirect URI for ``redirect_uri``.
+
+    CodeQL py/url-redirection (#3-#7): the request-supplied value is only
+    ever used as a lookup key; the URL we actually redirect to comes from
+    the client's registered list (exact match), so taint cannot reach a
+    Location header. Raises ValueError when not registered.
+    """
+    for registered in getattr(client, "redirect_uris", None) or []:
+        if registered == redirect_uri:
+            return registered
+    raise ValueError("redirect_uri is not registered for this client")
 
 
 @app.get("/oauth/authorize", tags=["OAuth"])
@@ -835,14 +853,26 @@ async def authorize_page(
     if not app_state.oauth.validate_redirect_uri(client_id, redirect_uri):
         raise HTTPException(status_code=400, detail="Invalid redirect_uri")
 
+    # CodeQL #3: use the REGISTERED uri for downstream redirects.
+    try:
+        redirect_uri = _safe_redirect_target(redirect_uri, client)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid redirect_uri")
+
     # Require authenticated user session
     user = get_user_from_session(request) if request else None
     if not user:
-        # Redirect to login with return URL
-        login_url = f"/auth/login?next=/oauth/authorize?client_id={client_id}&redirect_uri={redirect_uri}&code_challenge={code_challenge}&scope={scope}"
-        if oauth_state:
-            login_url += f"&oauth_state={oauth_state}"
-        return RedirectResponse(url=login_url)
+        # Redirect to login with return URL (query params percent-encoded —
+        # a tainted value can't alter the login URL structure).
+        from urllib.parse import urlencode as _urlencode
+        next_qs = _urlencode({
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "code_challenge": code_challenge,
+            "scope": scope,
+            **({"oauth_state": oauth_state} if oauth_state else {}),
+        })
+        return RedirectResponse(url=f"/auth/login?next=/oauth/authorize?{next_qs}")
 
     # Honor persisted consent decisions for this exact scope
     from auth.database import get_oauth_consent
@@ -862,7 +892,8 @@ async def authorize_page(
         sep = "&" if "?" in redirect_uri else "?"
         deny_url = f"{redirect_uri}{sep}error=access_denied"
         if oauth_state:
-            deny_url += f"&state={oauth_state}"
+            from urllib.parse import quote as _q
+            deny_url += f"&state={_q(oauth_state)}"
         return RedirectResponse(url=deny_url)
 
     if consent and consent["decision"] == "approved":
@@ -874,11 +905,17 @@ async def authorize_page(
         sep = "&" if "?" in redirect_uri else "?"
         redirect_url = f"{redirect_uri}{sep}code={code}"
         if oauth_state:
-            redirect_url += f"&state={oauth_state}"
+            from urllib.parse import quote as _q
+            redirect_url += f"&state={_q(oauth_state)}"
         return RedirectResponse(url=redirect_url)
 
     # No persisted decision: render the consent screen
-    csrf_token = request.cookies.get("csrf_token") or secrets.token_urlsafe(32)
+    # CodeQL py/cookie-injection (#2): always mint a fresh server-side token
+    # for the Set-Cookie header. Reusing a client-supplied cookie value would
+    # let an attacker plant arbitrary data in the user's jar (header
+    # injection / session-adjacent fixation).
+    import secrets as _secrets
+    csrf_token = _secrets.token_urlsafe(32)
     hidden_params = {
         "client_id": client_id,
         "redirect_uri": redirect_uri,
@@ -1001,6 +1038,12 @@ async def authorize_consent(request: Request):
     if not app_state.oauth.validate_redirect_uri(client_id, redirect_uri):
         raise HTTPException(status_code=400, detail="Invalid redirect_uri")
 
+    # CodeQL #6/#7: redirect only to the REGISTERED uri.
+    try:
+        redirect_uri = _safe_redirect_target(redirect_uri, client)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid redirect_uri")
+
     # CSRF double-submit verification for cookie-authenticated form posts
     if "application/json" not in content_type:
         if not _verify_consent_csrf(request, csrf_token):
@@ -1018,7 +1061,8 @@ async def authorize_consent(request: Request):
         )
         redirect_url = f"{redirect_uri}{sep}code={code}"
         if oauth_state:
-            redirect_url += f"&state={oauth_state}"
+            from urllib.parse import quote as _q
+            redirect_url += f"&state={_q(oauth_state)}"
         return RedirectResponse(url=redirect_url, status_code=303)
 
     save_oauth_consent(user["id"], client_id, scope, "denied")
@@ -1035,7 +1079,8 @@ async def authorize_consent(request: Request):
         )
     deny_url = f"{redirect_uri}{sep}error=access_denied"
     if oauth_state:
-        deny_url += f"&state={oauth_state}"
+        from urllib.parse import quote as _q
+        deny_url += f"&state={_q(oauth_state)}"
     return RedirectResponse(url=deny_url, status_code=303)
 
 
@@ -1504,9 +1549,12 @@ async def disconnect_connector(connector_name: str, request: Request):
     user = get_user_from_session(request)
     if not user:
         return RedirectResponse(url="/auth/login")
-    
+
     await get_token_store().delete_token(user["id"], connector_name)
-    return RedirectResponse(url=f"/connectors/{connector_name}", status_code=303)
+    # CodeQL #8: connector_name is a path segment — percent-encode it so a
+    # crafted value can't alter the redirect target structure.
+    from urllib.parse import quote as _q
+    return RedirectResponse(url=f"/connectors/{_q(connector_name, safe='')}", status_code=303)
 
 
 @app.get("/connectors/{connector_name}", tags=["Web UI"])
@@ -2284,7 +2332,11 @@ async def readiness():
             finally:
                 conn.close()
         except sqlite3.Error as exc:
-            sqlite_error = str(exc) or type(exc).__name__
+            # CodeQL py/stack-trace-exposure (#1): log detail server-side;
+            # public JSON gets a static marker only.
+            import logging as _logging
+            _logging.getLogger(__name__).warning("sqlite readiness check failed: %s", exc)
+            sqlite_error = "unavailable"
     sqlite_check: Dict[str, Any] = {"ok": sqlite_error is None}
     if db_path is None:
         sqlite_check["skipped"] = "non-sqlite database URL configured"
@@ -2310,7 +2362,12 @@ async def readiness():
             redis_error = str(exc) or type(exc).__name__
         redis_check["ok"] = redis_error is None
         if redis_error is not None:
-            redis_check["error"] = redis_error
+            # CodeQL py/stack-trace-exposure (#1): keep raw exception detail
+            # in logs only — the public health JSON gets a static marker so
+            # internal hosts/paths can't leak.
+            import logging as _logging
+            _logging.getLogger(__name__).warning("redis readiness check failed: %s", redis_error)
+            redis_check["error"] = "unavailable"
     checks["redis"] = redis_check
 
     ready = all(check["ok"] for check in checks.values())
