@@ -3857,7 +3857,7 @@ def _build_mcp_tool_handler(
 ):
     """Build an MCP tool handler as a closure.
 
-    Replaces the previous exec()-based code generation: no dynamic source
+    Replaces the previous dynamic source-generation approach: no dynamic source
     compilation, and credentials are never interpolated into function
     source. The handler exposes an explicit __signature__ so FastMCP schema
     generation continues to work.
