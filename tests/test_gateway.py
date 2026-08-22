@@ -255,6 +255,42 @@ class TestInputValidator:
         assert valid is False
         assert "exceeds maximum length" in result
 
+    def test_long_string_scanned_not_rejected(self):
+        # Issue #9: strings above the old MAX_PATTERN_LENGTH (1000) must be
+        # scanned rather than blanket-rejected.
+        from security.middleware import InputValidator
+        v = InputValidator()
+        payload = ("Lorem ipsum dolor sit amet. " * 200)  # ~5600 chars, benign
+        assert len(payload) > 1000
+        valid, result = v.validate_string(payload, "document")
+        assert valid is True
+        assert result == payload
+
+    def test_long_string_with_dangerous_pattern_rejected(self):
+        from security.middleware import InputValidator
+        v = InputValidator()
+        payload = ("safe text here. " * 400) + "; rm -rf /"
+        assert len(payload) > 1000
+        valid, result = v.validate_string(payload, "document")
+        assert valid is False
+        assert "dangerous content" in result
+
+    def test_dangerous_pattern_spanning_chunk_boundary_caught(self):
+        from security.middleware import InputValidator
+        v = InputValidator()
+        # Pattern straddles the SCAN_CHUNK_SIZE boundary.
+        payload = "x" * (InputValidator.SCAN_CHUNK_SIZE - 10) + " union select " + "y" * 500
+        assert len(payload) > InputValidator.SCAN_CHUNK_SIZE
+        valid, _ = v.validate_string(payload, "document")
+        assert valid is False
+
+    def test_oversize_string_still_rejected(self):
+        from security.middleware import InputValidator
+        v = InputValidator(max_string_length=100000)
+        valid, result = v.validate_string("a" * 100001, "blob")
+        assert valid is False
+        assert "exceeds maximum length" in result
+
     def test_dangerous_sql_pattern(self):
         from security.middleware import InputValidator
         v = InputValidator()
@@ -519,7 +555,7 @@ class TestRequestIDMiddleware:
         mock_state.backends.list_backends.return_value = []
         server_module.state = mock_state
 
-        return TestClient(server_module.app, raise_server_exceptions=False)
+        return TestClient(server_module.app, base_url="https://testserver", raise_server_exceptions=False)
 
     def test_response_contains_request_id(self):
         client = self._client()
@@ -594,7 +630,63 @@ class TestFastAPIEndpoints:
     def _client(self):
         from fastapi.testclient import TestClient
         import gateway.server as server_module
-        return TestClient(server_module.app, raise_server_exceptions=False)
+        return TestClient(server_module.app, base_url="https://testserver", raise_server_exceptions=False)
+
+    def _register_and_login(self, client, username: str):
+        """Register (idempotent) and log in a user, storing the session cookie."""
+        from auth import database as db
+        db.init_db()  # TestClient skips lifespan, so ensure schema exists
+        reg = client.post(
+            "/auth/register",
+            json={"username": username, "password": "test-password-123"},
+        )
+        assert reg.status_code in (200, 409), reg.text  # 409 = already exists
+        login = client.post(
+            "/auth/login",
+            json={"username": username, "password": "test-password-123"},
+        )
+        assert login.status_code == 200, login.text
+        return login.json()
+
+    def _authorize_via_consent(self, client, cid: str, scope: str = "mcp:tools",
+                               decision: str = "approve") -> str:
+        """Run the full consent flow and return the authorization code."""
+        # 1. Fetch the consent screen (sets the CSRF cookie)
+        page = client.get(
+            "/oauth/authorize",
+            params={
+                "client_id": cid,
+                "redirect_uri": "http://localhost/cb",
+                "code_challenge": "test-challenge",
+                "code_challenge_method": "S256",
+                "scope": scope,
+            },
+        )
+        assert page.status_code == 200, page.text
+        csrf_token = client.cookies.get("csrf_token")
+        assert csrf_token, "consent page must set a CSRF cookie"
+
+        # 2. Submit the decision
+        posted = client.post(
+            "/oauth/authorize/consent",
+            data={
+                "client_id": cid,
+                "redirect_uri": "http://localhost/cb",
+                "code_challenge": "test-challenge",
+                "code_challenge_method": "S256",
+                "scope": scope,
+                "decision": decision,
+                "csrf_token": csrf_token,
+            },
+            follow_redirects=False,
+        )
+        assert posted.status_code == 303, posted.text
+        location = posted.headers["location"]
+        if decision == "approve":
+            assert "code=" in location, location
+            return location.split("code=")[1].split("&")[0]
+        assert "error=access_denied" in location, location
+        return ""
 
     def test_health_returns_200(self):
         resp = self._client().get("/health")
@@ -604,11 +696,11 @@ class TestFastAPIEndpoints:
         assert "backends" in body
         assert "circuit_open" in body["backends"]
 
-    def test_root_returns_200(self):
-        resp = self._client().get("/")
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body["status"] == "running"
+    def test_root_redirects_based_on_session(self):
+        """Root path redirects to /app (logged in) or /auth/login (anonymous)."""
+        resp = self._client().get("/", follow_redirects=False)
+        assert resp.status_code in (301, 302, 303, 307, 308)
+        assert "/auth/login" in resp.headers.get("location", "")
 
     def test_register_client_returns_client_id(self):
         resp = self._client().post(
@@ -669,10 +761,11 @@ class TestFastAPIEndpoints:
         assert "Maximum 10" in resp.json()["error"]
 
     def test_complete_oauth_flow_and_call(self):
-        """Register client → PKCE → auth code → token → validate."""
+        """Register client → PKCE → session login → auth code → token → validate."""
         from auth.oauth import generate_code_challenge, generate_code_verifier
 
         client = self._client()
+        self._register_and_login(client, "oauth_e2e_user")
 
         # 1. Register
         reg = client.post(
@@ -685,8 +778,8 @@ class TestFastAPIEndpoints:
         verifier = generate_code_verifier()
         challenge = generate_code_challenge(verifier)
 
-        # 3. Auth code
-        auth_resp = client.get(
+        # 3. Auth code via the consent screen (session-authenticated)
+        page = client.get(
             "/oauth/authorize",
             params={
                 "client_id": cid,
@@ -695,8 +788,26 @@ class TestFastAPIEndpoints:
                 "code_challenge_method": "S256",
                 "scope": "mcp:tools",
             },
-        ).json()
-        code = auth_resp["code"]
+        )
+        assert page.status_code == 200, page.text
+        csrf_token = client.cookies.get("csrf_token")
+        consent_resp = client.post(
+            "/oauth/authorize/consent",
+            data={
+                "client_id": cid,
+                "redirect_uri": "http://localhost/cb",
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+                "scope": "mcp:tools",
+                "decision": "approve",
+                "csrf_token": csrf_token,
+            },
+            follow_redirects=False,
+        )
+        assert consent_resp.status_code == 303, consent_resp.text
+        location = consent_resp.headers["location"]
+        assert location.startswith("http://localhost/cb"), location
+        code = location.split("code=")[1].split("&")[0]
 
         # 4. Exchange
         token_resp = client.post(
@@ -717,6 +828,7 @@ class TestFastAPIEndpoints:
         from auth.oauth import generate_code_challenge, generate_code_verifier
 
         client = self._client()
+        self._register_and_login(client, "oauth_refresh_user")
 
         reg = client.post(
             "/oauth/register",
@@ -727,7 +839,7 @@ class TestFastAPIEndpoints:
         verifier = generate_code_verifier()
         challenge = generate_code_challenge(verifier)
 
-        code = client.get(
+        page = client.get(
             "/oauth/authorize",
             params={
                 "client_id": cid,
@@ -736,7 +848,24 @@ class TestFastAPIEndpoints:
                 "code_challenge_method": "S256",
                 "scope": "mcp:tools",
             },
-        ).json()["code"]
+        )
+        assert page.status_code == 200, page.text
+        csrf_token = client.cookies.get("csrf_token")
+        consent_resp = client.post(
+            "/oauth/authorize/consent",
+            data={
+                "client_id": cid,
+                "redirect_uri": "http://localhost/cb",
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+                "scope": "mcp:tools",
+                "decision": "approve",
+                "csrf_token": csrf_token,
+            },
+            follow_redirects=False,
+        )
+        assert consent_resp.status_code == 303, consent_resp.text
+        code = consent_resp.headers["location"].split("code=")[1].split("&")[0]
 
         tokens = client.post(
             "/oauth/token",
@@ -981,7 +1110,7 @@ class TestUserAuth:
     def test_register_success(self):
         from fastapi.testclient import TestClient
         import gateway.server as server_module
-        client = TestClient(server_module.app, raise_server_exceptions=False)
+        client = TestClient(server_module.app, base_url="https://testserver", raise_server_exceptions=False)
 
         resp = self._register_user(client, "newuser", "TestPass123")
         assert resp.status_code == 200
@@ -992,7 +1121,7 @@ class TestUserAuth:
     def test_register_duplicate_username(self):
         from fastapi.testclient import TestClient
         import gateway.server as server_module
-        client = TestClient(server_module.app, raise_server_exceptions=False)
+        client = TestClient(server_module.app, base_url="https://testserver", raise_server_exceptions=False)
 
         self._register_user(client, "dupuser", "TestPass123")
         resp = self._register_user(client, "dupuser", "OtherPass456")
@@ -1001,7 +1130,7 @@ class TestUserAuth:
     def test_register_short_password(self):
         from fastapi.testclient import TestClient
         import gateway.server as server_module
-        client = TestClient(server_module.app, raise_server_exceptions=False)
+        client = TestClient(server_module.app, base_url="https://testserver", raise_server_exceptions=False)
 
         resp = self._register_user(client, "shortpw", "abc")
         assert resp.status_code == 400
@@ -1009,7 +1138,7 @@ class TestUserAuth:
     def test_register_short_username(self):
         from fastapi.testclient import TestClient
         import gateway.server as server_module
-        client = TestClient(server_module.app, raise_server_exceptions=False)
+        client = TestClient(server_module.app, base_url="https://testserver", raise_server_exceptions=False)
 
         resp = self._register_user(client, "ab", "TestPass123")
         assert resp.status_code == 400
@@ -1041,13 +1170,72 @@ class TestUserAuth:
             security=security, backends=backends, connectors=connectors,
         )
 
-        client = TestClient(server_module.app, raise_server_exceptions=False)
+        client = TestClient(server_module.app, base_url="https://testserver", raise_server_exceptions=False)
         self._register_user(client, "loginuser", "TestPass123")
         resp = self._login_user(client, "loginuser", "TestPass123")
         assert resp.status_code == 200
         assert "session" in resp.cookies
 
         server_module.state = None
+
+    def test_session_cookie_secure_flag_tied_to_environment(self):
+        # Issue #9: the session cookie must be marked Secure unless
+        # RELAY_ALLOW_INSECURE_COOKIES=1 (dev-only escape hatch).
+        from fastapi.testclient import TestClient
+        import gateway.server as server_module
+        from auth.oauth import create_oauth_provider
+        from auth.oauth_providers import create_oauth_provider as create_connector_oauth
+        from backends.manager import BackendManager
+        from config.settings import RelayConfig
+        from connectors import ConnectorRegistry
+        from security.middleware import AuditLogger, InputValidator, IPRestrictions, RateLimiter, SecurityContext
+
+        audit = AuditLogger(log_path="/tmp/test_audit_cookie.log", enabled=False)
+
+        def _setup(allow_insecure: bool):
+            config = RelayConfig(
+                environment="development",
+                allow_insecure_cookies=allow_insecure,
+            )
+            oauth = create_oauth_provider("test-secret-key-cookie")
+            connector_oauth = create_connector_oauth(config)
+            security = SecurityContext(
+                rate_limiter=RateLimiter(60, 1000),
+                validator=InputValidator(),
+                audit_logger=audit,
+                ip_restrictions=IPRestrictions(),
+            )
+            server_module.state = server_module.AppState(
+                config=config, oauth=oauth, connector_oauth=connector_oauth,
+                security=security, backends=BackendManager(),
+                connectors=ConnectorRegistry(),
+            )
+            return TestClient(server_module.app, base_url="https://testserver", raise_server_exceptions=False)
+
+        try:
+            client = _setup(allow_insecure=False)
+            self._register_user(client, "cookieuser", "TestPass123")
+            resp = self._login_user(client, "cookieuser", "TestPass123")
+            assert resp.status_code == 200
+            set_cookie = resp.headers.get("set-cookie", "")
+            session_part = next(
+                (p for p in set_cookie.split(", ") if p.startswith("session=")), ""
+            )
+            assert session_part, f"no session cookie in Set-Cookie: {set_cookie}"
+            assert "Secure" in session_part.split("; ")
+
+            client2 = _setup(allow_insecure=True)
+            self._register_user(client2, "cookieuser2", "TestPass123")
+            resp2 = self._login_user(client2, "cookieuser2", "TestPass123")
+            assert resp2.status_code == 200
+            set_cookie2 = resp2.headers.get("set-cookie", "")
+            session_part2 = next(
+                (p for p in set_cookie2.split(", ") if p.startswith("session=")), ""
+            )
+            assert session_part2, f"no session cookie in Set-Cookie: {set_cookie2}"
+            assert "Secure" not in session_part2.split("; ")
+        finally:
+            server_module.state = None
 
     def test_login_wrong_password(self):
         from fastapi.testclient import TestClient
@@ -1076,7 +1264,7 @@ class TestUserAuth:
             security=security, backends=backends, connectors=connectors,
         )
 
-        client = TestClient(server_module.app, raise_server_exceptions=False)
+        client = TestClient(server_module.app, base_url="https://testserver", raise_server_exceptions=False)
         self._register_user(client, "wrongpw", "TestPass123")
         resp = self._login_user(client, "wrongpw", "WrongPass456")
         assert resp.status_code == 401
@@ -1110,7 +1298,7 @@ class TestUserAuth:
             security=security, backends=backends, connectors=connectors,
         )
 
-        client = TestClient(server_module.app, raise_server_exceptions=False)
+        client = TestClient(server_module.app, base_url="https://testserver", raise_server_exceptions=False)
         resp = self._login_user(client, "nobody", "TestPass123")
         assert resp.status_code == 401
 
@@ -1143,7 +1331,7 @@ class TestUserAuth:
             security=security, backends=backends, connectors=connectors,
         )
 
-        client = TestClient(server_module.app, raise_server_exceptions=False)
+        client = TestClient(server_module.app, base_url="https://testserver", raise_server_exceptions=False)
         self._register_user(client, "meme", "TestPass123", "meme@test.com")
         self._login_user(client, "meme", "TestPass123")
         resp = client.get("/auth/me")
@@ -1157,7 +1345,7 @@ class TestUserAuth:
     def test_get_me_without_session(self):
         from fastapi.testclient import TestClient
         import gateway.server as server_module
-        client = TestClient(server_module.app, raise_server_exceptions=False)
+        client = TestClient(server_module.app, base_url="https://testserver", raise_server_exceptions=False)
 
         resp = client.get("/auth/me")
         assert resp.status_code == 401
@@ -1165,7 +1353,7 @@ class TestUserAuth:
     def test_dashboard_redirects_without_session(self):
         from fastapi.testclient import TestClient
         import gateway.server as server_module
-        client = TestClient(server_module.app, raise_server_exceptions=False)
+        client = TestClient(server_module.app, base_url="https://testserver", raise_server_exceptions=False)
 
         resp = client.get("/app", follow_redirects=False)
         assert resp.status_code == 307
@@ -1198,7 +1386,7 @@ class TestUserAuth:
             security=security, backends=backends, connectors=connectors,
         )
 
-        client = TestClient(server_module.app, raise_server_exceptions=False)
+        client = TestClient(server_module.app, base_url="https://testserver", raise_server_exceptions=False)
         self._register_user(client, "dashuser", "TestPass123")
         self._login_user(client, "dashuser", "TestPass123")
         resp = client.get("/app")
@@ -1210,7 +1398,7 @@ class TestUserAuth:
     def test_logout_clears_session(self):
         from fastapi.testclient import TestClient
         import gateway.server as server_module
-        client = TestClient(server_module.app, raise_server_exceptions=False)
+        client = TestClient(server_module.app, base_url="https://testserver", raise_server_exceptions=False)
 
         self._register_user(client, "logoutuser", "TestPass123")
         self._login_user(client, "logoutuser", "TestPass123")

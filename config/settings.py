@@ -10,7 +10,7 @@ import os
 import secrets
 from typing import Any, Dict, List, Optional
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -129,9 +129,31 @@ class SecuritySettings(BaseSettings):
         "password", "token", "secret", "key", "credential", "api_key"
     ])
 
+    # Audit log rotation & retention
+    # Max size of a single audit file before rotation (default 100 MB)
+    audit_log_max_bytes: int = 100 * 1024 * 1024
+    # Number of rotated files to keep (audit.log.1 .. audit.log.N)
+    audit_log_max_files: int = 10
+    # Delete rotated files older than this many days (None = keep until rotated out)
+    audit_log_retention_days: Optional[int] = None
+
     # IP restrictions
     ip_whitelist: List[str] = Field(default_factory=list)
     ip_blacklist: List[str] = Field(default_factory=list)
+
+    # Result DLP (credential-shaped content scrubbed from tool call results)
+    # Env: RELAY_SECURITY__RESULT_DLP_ENABLED / RELAY_SECURITY__RESULT_DLP_MODE
+    result_dlp_enabled: bool = True
+    # "redact" = deliver sanitized results; "block" = reject violating results.
+    result_dlp_mode: str = "redact"
+
+    @field_validator("result_dlp_mode")
+    @classmethod
+    def validate_result_dlp_mode(cls, v: str) -> str:
+        allowed = {"redact", "block"}
+        if v not in allowed:
+            raise ValueError(f"result_dlp_mode must be one of {allowed}")
+        return v
 
     # CSRF protection
     csrf_enabled: bool = True
@@ -245,6 +267,10 @@ class RelayConfig(BaseSettings):
     # Environment
     environment: str = Field(default="development")
 
+    # Cookie security: session cookies are always marked Secure unless this
+    # explicit escape hatch is set (intended for local HTTP development only).
+    allow_insecure_cookies: bool = False
+
     # Sub-configurations
     oauth: OAuthSettings = Field(default_factory=OAuthSettings)
     github_oauth: GitHubOAuthSettings = Field(default_factory=GitHubOAuthSettings)
@@ -265,6 +291,17 @@ class RelayConfig(BaseSettings):
         if v not in allowed:
             raise ValueError(f"environment must be one of {allowed}")
         return v
+
+    @model_validator(mode="after")
+    def enforce_secure_cookies_in_production(self) -> "RelayConfig":
+        """Fail fast if the insecure-cookie escape hatch is used in production."""
+        if self.environment == "production" and self.allow_insecure_cookies:
+            raise ValueError(
+                "RELAY_ALLOW_INSECURE_COOKIES=true is forbidden when "
+                "RELAY_ENVIRONMENT=production: session cookies must be marked "
+                "Secure. Use a development environment for local HTTP testing."
+            )
+        return self
 
     @field_validator("oauth")
     @classmethod

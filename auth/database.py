@@ -121,6 +121,21 @@ def init_db() -> sqlite3.Connection:
             expires_at TEXT NOT NULL
         )
     """)
+
+    # OAuth consent decisions (per user + client + scope)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS oauth_consents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            client_id TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            decision TEXT NOT NULL CHECK(decision IN ('approved','denied')),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(user_id, client_id, scope)
+        )
+    """)
+
     
     # Create indexes
     conn.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)")
@@ -221,7 +236,7 @@ def init_db() -> sqlite3.Connection:
     
     conn.commit()
     logger.info(f"Database initialized at {get_db_path()}")
-    
+    conn.close()
     return conn
 
 
@@ -496,6 +511,36 @@ def delete_auth_code(code: str) -> bool:
 
 
 # -----------------------------------------------------------------------------
+# OAuth Consent Decisions
+# -----------------------------------------------------------------------------
+
+def save_oauth_consent(user_id: str, client_id: str, scope: str, decision: str) -> None:
+    """Persist an approve/deny consent decision for a user+client+scope."""
+    if decision not in ("approved", "denied"):
+        raise ValueError("decision must be 'approved' or 'denied'")
+    conn = get_connection()
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        """INSERT INTO oauth_consents (user_id, client_id, scope, decision, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(user_id, client_id, scope)
+           DO UPDATE SET decision = excluded.decision, updated_at = excluded.updated_at""",
+        (user_id, client_id, scope, decision, now, now),
+    )
+    conn.commit()
+
+
+def get_oauth_consent(user_id: str, client_id: str, scope: str) -> Optional[Dict[str, Any]]:
+    """Return the persisted consent row for user+client+scope, or None."""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT * FROM oauth_consents WHERE user_id = ? AND client_id = ? AND scope = ?",
+        (user_id, client_id, scope),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+# -----------------------------------------------------------------------------
 # Token Revocation
 # -----------------------------------------------------------------------------
 
@@ -597,6 +642,11 @@ def create_user(
             "is_admin": is_admin,
         }
     except sqlite3.IntegrityError:
+        # Roll back and close so the failed INSERT's write transaction does
+        # not hold the database lock for the rest of the process (every later
+        # write would fail with "database is locked").
+        conn.rollback()
+        conn.close()
         return None
 
 
@@ -819,6 +869,16 @@ def list_api_keys(user_id: str) -> List[Dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
+def list_all_api_keys() -> List[Dict[str, Any]]:
+    """List every API key across users (admin-only reporting)."""
+    conn = get_connection()
+    rows = conn.execute(
+        """SELECT key, user_id, name, last_used_at, created_at, expires_at, is_active
+           FROM api_keys ORDER BY created_at DESC"""
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def delete_api_key(user_id: str, key: str) -> bool:
     """Delete (deactivate) an API key."""
     conn = get_connection()
@@ -910,7 +970,9 @@ def set_connector_permission(
         # Convert to sets for union operation, then back to list
         merged_tools = list(set(existing_tools) | set(tools))
     
-    tools_json = json.dumps(merged_tools) if merged_tools else None
+    tools_json = json.dumps(merged_tools) if merged_tools is not None else "null"
+    # NOTE: the column is NOT NULL, so "all tools" is stored as the JSON text
+    # 'null' (readers json.loads() it back to None); [] stays a real empty list.
     
     conn.execute("""
         INSERT OR REPLACE INTO connector_permissions 

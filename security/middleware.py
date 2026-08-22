@@ -27,6 +27,8 @@ from typing import Any, Callable, Dict, List, Optional, Set, TYPE_CHECKING
 
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from security.dlp import ResultDLPInspector, get_dlp_inspector
+
 if TYPE_CHECKING:
     from fastapi import Request
 
@@ -205,7 +207,14 @@ class InputValidator:
         r"private[_-]?key",
     ]
 
-    MAX_PATTERN_LENGTH = 1000
+    # Long strings are scanned in overlapping chunks rather than blanket-
+    # rejected, so legitimate large payloads (documents, base64 blobs,
+    # big JSON) pass validation while injection patterns remain correct
+    # on short strings AND across chunk boundaries.
+    SCAN_CHUNK_SIZE = 8192
+    # Must exceed the longest fixed-length match of any DANGEROUS_PATTERNS
+    # entry so matches near a chunk boundary are seen by the next chunk.
+    SCAN_CHUNK_OVERLAP = 256
 
     def __init__(
         self,
@@ -225,9 +234,44 @@ class InputValidator:
             re.IGNORECASE
         )
 
+    def _contains_dangerous_pattern(self, value: str) -> bool:
+        """
+        Scan *value* for dangerous patterns with bounded work per chunk.
+
+        Short strings are scanned in one pass. Longer strings are scanned in
+        overlapping chunks (``SCAN_CHUNK_SIZE`` with ``SCAN_CHUNK_OVERLAP``
+        carried between chunks) which keeps per-chunk regex work and peak
+        memory bounded for very large payloads — i.e. safe to run on strings
+        produced by streaming sources.
+
+        Anchored patterns such as ``--\\s*$`` are evaluated against each
+        chunk's tail; the final chunk always ends at the true end of the
+        input, so end-of-input anchors still behave correctly overall.
+
+        Known trade-off (documented): a ``select ... from`` construct whose
+        two halves are separated by more than the overlap window AND straddle
+        a chunk boundary may evade detection. Acceptable for this control.
+        """
+        if len(value) <= self.SCAN_CHUNK_SIZE:
+            return bool(self._dangerous_re.search(value))
+
+        step = self.SCAN_CHUNK_SIZE - self.SCAN_CHUNK_OVERLAP
+        start = 0
+        while start < len(value):
+            chunk = value[start:start + self.SCAN_CHUNK_SIZE]
+            if self._dangerous_re.search(chunk):
+                return True
+            if start + self.SCAN_CHUNK_SIZE >= len(value):
+                break
+            start += step
+        return False
+
     def validate_string(self, value: str, field_name: str = "input") -> tuple[bool, str]:
         """
         Validate a string value.
+
+        Strings up to ``max_string_length`` are accepted after a
+        dangerous-pattern scan; only oversized strings are rejected outright.
 
         Returns:
             (is_valid, sanitized_value_or_error)
@@ -235,12 +279,8 @@ class InputValidator:
         if len(value) > self.max_string_length:
             return False, f"{field_name} exceeds maximum length ({self.max_string_length})"
         
-        if len(value) > self.MAX_PATTERN_LENGTH:
-            logger.warning(f"Input too long for pattern matching in {field_name}")
-            return False, f"{field_name} too long for security validation"
-        
         try:
-            if self._dangerous_re.search(value):
+            if self._contains_dangerous_pattern(value):
                 logger.warning(f"Potential injection detected in {field_name}")
                 return False, f"{field_name} contains potentially dangerous content"
         except re.error:
@@ -356,12 +396,22 @@ class AuditLogger:
         log_path: str,
         enabled: bool = True,
         sensitive_fields: Optional[List[str]] = None,
+        max_bytes: int = 100 * 1024 * 1024,
+        max_files: int = 10,
+        retention_days: Optional[int] = None,
     ):
         self.enabled = enabled
         self.log_path = log_path
         self.sensitive_fields = set(sensitive_fields or [])
+        self.max_bytes = max_bytes
+        self.max_files = max_files
+        self.retention_days = retention_days
         self._last_hash: str = ""
+        # Serializes rotation + append so concurrent events cannot interleave
+        # mid-shift and write into a file that is being renamed.
+        self._lock = threading.Lock()
         self._ensure_log_directory()
+        self._prune_expired_rotations()
         self._load_last_hash()
 
     def _ensure_log_directory(self) -> None:
@@ -441,10 +491,13 @@ class AuditLogger:
 
         final_entry = json.dumps(log_dict)
 
-        # Log to file
+        # Log to file (with size-based rotation)
         try:
-            with open(self.log_path, "a") as f:
-                f.write(final_entry + "\n")
+            with self._lock:
+                self._rotate_if_needed()
+                self._prune_expired_rotations()
+                with open(self.log_path, "a") as f:
+                    f.write(final_entry + "\n")
         except Exception as e:
             logger.error(f"Failed to write audit log: {e}")
 
@@ -455,6 +508,41 @@ class AuditLogger:
             f"AUDIT: {event.event_type} client={event.client_id[:12]}... "
             f"user={event.user_id} action={event.action} success={event.success}"
         )
+
+    def _rotate_if_needed(self) -> None:
+        """Rotate the audit log when it exceeds max_bytes (keeps max_files)."""
+        try:
+            if not os.path.exists(self.log_path):
+                return
+            if os.path.getsize(self.log_path) < self.max_bytes:
+                return
+            # Shift existing rotations: .N -> .N+1 (oldest dropped)
+            oldest = f"{self.log_path}.{self.max_files}"
+            if os.path.exists(oldest):
+                os.remove(oldest)
+            for i in range(self.max_files - 1, 0, -1):
+                src = f"{self.log_path}.{i}"
+                if os.path.exists(src):
+                    os.replace(src, f"{self.log_path}.{i + 1}")
+            os.replace(self.log_path, f"{self.log_path}.1")
+        except Exception as e:
+            logger.error(f"Audit log rotation failed: {e}")
+
+    def _prune_expired_rotations(self) -> None:
+        """Delete rotated audit files older than retention_days."""
+        if not self.retention_days:
+            return
+        try:
+            cutoff = time.time() - self.retention_days * 86400
+            directory = os.path.dirname(self.log_path) or "."
+            base = os.path.basename(self.log_path)
+            for name in os.listdir(directory):
+                if name.startswith(base + "."):
+                    path = os.path.join(directory, name)
+                    if os.path.getmtime(path) < cutoff:
+                        os.remove(path)
+        except Exception as e:
+            logger.error(f"Audit log retention pruning failed: {e}")
 
     def _hash_ip(self, ip: str) -> str:
         """Hash IP address for privacy (one-way, not reversible)."""
@@ -554,11 +642,14 @@ class SecurityContext:
         validator: Optional[InputValidator] = None,
         audit_logger: Optional[AuditLogger] = None,
         ip_restrictions: Optional[IPRestrictions] = None,
+        dlp_inspector: Optional["ResultDLPInspector"] = None,
     ):
         self.rate_limiter = rate_limiter or RateLimiter()
         self.validator = validator or InputValidator()
         self.audit = audit_logger
         self.ip = ip_restrictions or IPRestrictions()
+        # Result-DLP inspector; None means "use the process-wide default".
+        self.dlp_inspector = dlp_inspector
 
     def check_request(
         self,
@@ -626,6 +717,11 @@ class SecurityContext:
     ) -> None:
         """Log a tool call for audit."""
         if self.audit:
+            # The result summary may echo backend content (including
+            # credential-shaped strings) into the audit trail, so it is
+            # scrubbed through the same redaction engine as results.
+            if result_summary:
+                result_summary = self._redact_result_preview(result_summary)
             self.audit.log(
                 event_type="tool_call",
                 client_id=client_id,
@@ -639,6 +735,16 @@ class SecurityContext:
                     "result_summary": result_summary,
                 },
             )
+
+    def _redact_result_preview(self, text: str) -> str:
+        """Redact credential-shaped substrings from an audit preview."""
+        inspector = self.dlp_inspector or get_dlp_inspector()
+        if not getattr(inspector, "enabled", False):
+            # DLP disabled: still apply the cheap value-pattern pass so the
+            # log sink itself never stores obvious credentials.
+            fallback = ResultDLPInspector(enabled=True)
+            return fallback._redact_content(text)
+        return inspector._redact_content(text)
 
 
 class HSTSMiddleware(BaseHTTPMiddleware):

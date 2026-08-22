@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import secrets
+import sqlite3
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -64,6 +65,70 @@ from security.middleware import (
     MetricsMiddleware,
 )
 from security.csrf import CSRFMiddleware
+from security.dlp import ResultDLPInspector, get_dlp_inspector, set_dlp_inspector
+
+
+def _dlp_inspect(result: Any) -> Any:
+    """Run result-DLP using the state-configured inspector when available."""
+    app_state = globals().get("state")
+    inspector = None
+    if app_state is not None:
+        inspector = getattr(app_state.security, "dlp_inspector", None)
+    if inspector is None:
+        inspector = get_dlp_inspector()
+    return inspector.inspect_result(result)
+
+
+def _dlp_enforce(
+    result: Any,
+    tool_name: str,
+    user: Optional[Dict[str, Any]] = None,
+    ip: Optional[str] = None,
+) -> Any:
+    """
+    Run result-DLP enforcement for a tool result.
+
+    Uses the state-configured inspector when available, falling back to the
+    process-wide default.  Violations are written to the audit log with a
+    redacted preview (never the secret itself).
+
+    Returns the (possibly sanitized) result, or ``None`` when the inspector
+    runs in ``block`` mode and the result tripped a detector — callers must
+    treat ``None`` as "do not deliver this result".
+    """
+    app_state = globals().get("state")
+    inspector = None
+    if app_state is not None:
+        inspector = getattr(app_state.security, "dlp_inspector", None)
+    if inspector is None:
+        inspector = get_dlp_inspector()
+
+    if not inspector.enabled:
+        return result
+
+    output, violations = inspector.enforce(result)
+    if violations:
+        user = user or {}
+        details = {
+            "tool": tool_name,
+            "mode": inspector.mode,
+            "violations": ResultDLPInspector.format_violations(violations),
+        }
+        audit = getattr(getattr(app_state, "security", None), "audit", None)
+        if audit is not None:
+            audit.log(
+                event_type="dlp_result_violation",
+                client_id=str(user.get("client_id", "unknown"))[:64],
+                user_id=user.get("user_id"),
+                ip_address=ip or "unknown",
+                resource=tool_name,
+                action="result_dlp",
+                success=(inspector.mode != "block"),
+                details=details,
+            )
+        else:
+            logger.warning("Result DLP violation (audit log unavailable): %s", details)
+    return output
 from backends.manager import (
     BackendManager, 
     BackendDefinition, 
@@ -138,6 +203,37 @@ def _get_state() -> AppState:
     return state
 
 
+def _cookie_secure(config: RelayConfig) -> bool:
+    """
+    Whether cookies must carry the ``Secure`` attribute.
+
+    Cookies are always Secure unless RELAY_ALLOW_INSECURE_COOKIES=true was
+    explicitly set — and that escape hatch is rejected outright in production
+    (see RelayConfig.enforce_secure_cookies_in_production), so this only ever
+    returns False for local development over plain HTTP.
+    """
+    return not config.allow_insecure_cookies
+
+
+def _sqlite_db_path(app_state: "AppState") -> Optional[str]:
+    """
+    Resolve the SQLite database file to probe for the readiness check.
+
+    Returns ``None`` when a non-SQLite ``RELAY_DATABASE__URL`` is configured,
+    in which case there is no database file to open-probe. Otherwise this
+    resolves the exact path ``auth/database.py`` uses at runtime (including
+    the ``MCP_GATEWAY_DB_PATH`` override).
+    """
+    url = app_state.config.database.url
+    if url and not url.startswith("sqlite"):
+        return None
+    from auth import database as auth_db
+    try:
+        return str(auth_db.get_db_path())
+    except Exception:  # pragma: no cover - defensive fallback
+        return app_state.config.database.sqlite_path
+
+
 def _create_app_state_sync(config: RelayConfig) -> AppState:
     """
     Create AppState synchronously for standalone MCP server mode.
@@ -165,6 +261,9 @@ def _create_app_state_sync(config: RelayConfig) -> AppState:
         log_path=config.security.audit_log_path,
         enabled=config.security.audit_enabled,
         sensitive_fields=config.security.audit_sensitive_fields,
+        max_bytes=config.security.audit_log_max_bytes,
+        max_files=config.security.audit_log_max_files,
+        retention_days=config.security.audit_log_retention_days,
     )
     security = SecurityContext(
         rate_limiter=RateLimiter(
@@ -180,6 +279,10 @@ def _create_app_state_sync(config: RelayConfig) -> AppState:
         ip_restrictions=IPRestrictions(
             whitelist=config.security.ip_whitelist,
             blacklist=config.security.ip_blacklist,
+        ),
+        dlp_inspector=ResultDLPInspector(
+            enabled=config.security.result_dlp_enabled,
+            mode=config.security.result_dlp_mode,
         ),
     )
 
@@ -332,6 +435,9 @@ async def lifespan(app: FastAPI):
         log_path=config.security.audit_log_path,
         enabled=config.security.audit_enabled,
         sensitive_fields=config.security.audit_sensitive_fields,
+        max_bytes=config.security.audit_log_max_bytes,
+        max_files=config.security.audit_log_max_files,
+        retention_days=config.security.audit_log_retention_days,
     )
     security = SecurityContext(
         rate_limiter=RateLimiter(
@@ -347,6 +453,10 @@ async def lifespan(app: FastAPI):
         ip_restrictions=IPRestrictions(
             whitelist=config.security.ip_whitelist,
             blacklist=config.security.ip_blacklist,
+        ),
+        dlp_inspector=ResultDLPInspector(
+            enabled=config.security.result_dlp_enabled,
+            mode=config.security.result_dlp_mode,
         ),
     )
 
@@ -466,7 +576,8 @@ async def lifespan(app: FastAPI):
     )
     
     # Mount per-connector MCP servers on /mcp/{connector}
-    # Note: This is for shared/default tokens. For per-user MCP, use /user-mcp/{api_key}/{connector}/mcp
+    # Note: This is for shared/default tokens. For per-user MCP, use /user-mcp/{connector}/mcp
+    # with an Authorization header (see per_user_mcp_header_endpoint below).
     connector_session_managers = []
     for conn_name in ConnectorRegistry.CONNECTOR_TYPES:
         connector_mcp = create_connector_mcp_server(conn_name, app_state=state)
@@ -683,6 +794,18 @@ async def register_client(req: ClientRegistrationRequest):
     }
 
 
+def _verify_consent_csrf(request: Request, submitted_token: Optional[str]) -> bool:
+    """Double-submit CSRF check for the consent form (the /oauth/ prefix is
+    exempt from the global CSRF middleware because machine clients use it
+    without cookies; the consent form is cookie-authenticated so it verifies
+    its own token)."""
+    cookie_token = request.cookies.get("csrf_token")
+    if not cookie_token or not submitted_token:
+        return False
+    import hmac
+    return hmac.compare_digest(cookie_token, submitted_token)
+
+
 @app.get("/oauth/authorize", tags=["OAuth"])
 async def authorize_page(
     client_id: str,
@@ -696,9 +819,11 @@ async def authorize_page(
     """
     OAuth authorization endpoint.
 
-    Requires an authenticated user session. The user must be logged in
-    to authorize an OAuth client. In development with no users registered,
-    a demo user fallback can be enabled via RELAY_ENABLE_DEMO_USER=true.
+    Requires an authenticated user session. Renders a consent screen bound
+    to that session showing the client and requested scopes. Approve/deny
+    decisions are persisted per (user, client, scope); a stored approval
+    issues a code immediately, a stored denial redirects back with
+    ``error=access_denied``. Unauthenticated requests redirect to login.
     """
     app_state = _get_state()
 
@@ -719,7 +844,81 @@ async def authorize_page(
             login_url += f"&oauth_state={oauth_state}"
         return RedirectResponse(url=login_url)
 
-    # Create authorization code bound to the authenticated user
+    # Honor persisted consent decisions for this exact scope
+    from auth.database import get_oauth_consent
+    consent = get_oauth_consent(user["id"], client_id, scope)
+    if consent and consent["decision"] == "denied":
+        if app_state.security.audit:
+            app_state.security.audit.log(
+                event_type="oauth_consent_denied",
+                client_id=client_id,
+                user_id=user["id"],
+                ip_address="unknown",
+                resource="oauth",
+                action="authorize",
+                success=False,
+                details={"scope": scope, "persisted": True},
+            )
+        sep = "&" if "?" in redirect_uri else "?"
+        deny_url = f"{redirect_uri}{sep}error=access_denied"
+        if oauth_state:
+            deny_url += f"&state={oauth_state}"
+        return RedirectResponse(url=deny_url)
+
+    if consent and consent["decision"] == "approved":
+        code = _issue_authorization_code(
+            app_state, client_id=client_id, redirect_uri=redirect_uri,
+            code_challenge=code_challenge, code_challenge_method=code_challenge_method,
+            scope=scope, user=user,
+        )
+        sep = "&" if "?" in redirect_uri else "?"
+        redirect_url = f"{redirect_uri}{sep}code={code}"
+        if oauth_state:
+            redirect_url += f"&state={oauth_state}"
+        return RedirectResponse(url=redirect_url)
+
+    # No persisted decision: render the consent screen
+    csrf_token = request.cookies.get("csrf_token") or secrets.token_urlsafe(32)
+    hidden_params = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "code_challenge": code_challenge,
+        "code_challenge_method": code_challenge_method,
+        "scope": scope,
+    }
+    if oauth_state:
+        hidden_params["oauth_state"] = oauth_state
+
+    response = render_template(
+        "consent.html",
+        user=user,
+        client_id=client_id,
+        client_name=getattr(client, "client_name", None) or client_id,
+        scope_list=[s for s in scope.split() if s],
+        hidden_params=hidden_params,
+        csrf_token=csrf_token,
+    )
+    response.set_cookie(
+        key="csrf_token",
+        value=csrf_token,
+        httponly=False,
+        samesite="lax" if not app_state.config.is_production else "strict",
+        secure=_cookie_secure(app_state.config),
+        path="/",
+    )
+    return response
+
+
+def _issue_authorization_code(
+    app_state: AppState,
+    client_id: str,
+    redirect_uri: str,
+    code_challenge: str,
+    code_challenge_method: str,
+    scope: str,
+    user: Dict[str, Any],
+) -> str:
+    """Create an authorization code bound to the authenticated user and audit it."""
     code = app_state.oauth.create_authorization_code(
         client_id=client_id,
         redirect_uri=redirect_uri,
@@ -729,7 +928,7 @@ async def authorize_page(
         user_id=user["id"],
     )
 
-    # Log the authorization
+    # Log the authorization with the real authenticated user id
     if app_state.security.audit:
         app_state.security.audit.log(
             event_type="oauth_authorize",
@@ -741,16 +940,103 @@ async def authorize_page(
             success=True,
             details={"scope": scope},
         )
+    return code
 
-    redirect_url = f"{redirect_uri}?code={code}"
+
+@app.post("/oauth/authorize/consent", tags=["OAuth"])
+async def authorize_consent(request: Request):
+    """
+    Handle the consent form submission (or an equivalent JSON body).
+
+    Bound to the authenticated session; persists the approve/deny decision
+    and audits it with the real user id and client_id. On approval an
+    authorization code is issued and the user is redirected to the client's
+    redirect_uri. On denial the client is redirected with error=access_denied.
+    """
+    app_state = _get_state()
+
+    form = await request.form()
+    content_type = request.headers.get("content-type", "")
+
+    def _form_or_json(key: str, default=None):
+        if key in form:
+            return form[key]
+        return default
+
+    client_id = _form_or_json("client_id")
+    redirect_uri = _form_or_json("redirect_uri")
+    code_challenge = _form_or_json("code_challenge")
+    code_challenge_method = _form_or_json("code_challenge_method", "S256")
+    scope = _form_or_json("scope", "mcp:tools")
+    oauth_state = _form_or_json("oauth_state")
+    decision = _form_or_json("decision")
+    csrf_token = _form_or_json("csrf_token")
+
+    # JSON body support for non-browser clients
+    if "application/json" in content_type:
+        try:
+            body = json.loads((await request.body()).decode() or "{}")
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="Invalid JSON body")
+        client_id = body.get("client_id", client_id)
+        redirect_uri = body.get("redirect_uri", redirect_uri)
+        code_challenge = body.get("code_challenge", code_challenge)
+        code_challenge_method = body.get("code_challenge_method", code_challenge_method)
+        scope = body.get("scope", scope)
+        oauth_state = body.get("state", oauth_state)
+        decision = body.get("decision", decision)
+
+    if not all([client_id, redirect_uri, code_challenge]) or decision not in ("approve", "deny"):
+        raise HTTPException(status_code=400, detail="Missing consent parameters or invalid decision")
+
+    # Session-bound: unauthenticated submissions are rejected
+    user = get_user_from_session(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    # Validate client and redirect URI again (never trust form data)
+    client = app_state.oauth.get_client(client_id)
+    if not client:
+        raise HTTPException(status_code=400, detail="Invalid client_id")
+    if not app_state.oauth.validate_redirect_uri(client_id, redirect_uri):
+        raise HTTPException(status_code=400, detail="Invalid redirect_uri")
+
+    # CSRF double-submit verification for cookie-authenticated form posts
+    if "application/json" not in content_type:
+        if not _verify_consent_csrf(request, csrf_token):
+            raise HTTPException(status_code=403, detail="CSRF token validation failed")
+
+    from auth.database import save_oauth_consent
+
+    sep = "&" if "?" in redirect_uri else "?"
+    if decision == "approve":
+        save_oauth_consent(user["id"], client_id, scope, "approved")
+        code = _issue_authorization_code(
+            app_state, client_id=client_id, redirect_uri=redirect_uri,
+            code_challenge=code_challenge, code_challenge_method=code_challenge_method,
+            scope=scope, user=user,
+        )
+        redirect_url = f"{redirect_uri}{sep}code={code}"
+        if oauth_state:
+            redirect_url += f"&state={oauth_state}"
+        return RedirectResponse(url=redirect_url, status_code=303)
+
+    save_oauth_consent(user["id"], client_id, scope, "denied")
+    if app_state.security.audit:
+        app_state.security.audit.log(
+            event_type="oauth_consent_denied",
+            client_id=client_id,
+            user_id=user["id"],
+            ip_address="unknown",
+            resource="oauth",
+            action="authorize",
+            success=False,
+            details={"scope": scope},
+        )
+    deny_url = f"{redirect_uri}{sep}error=access_denied"
     if oauth_state:
-        redirect_url += f"&state={oauth_state}"
-
-    return {
-        "code": code,
-        "redirect_uri": redirect_uri,
-        "state": oauth_state,
-    }
+        deny_url += f"&state={oauth_state}"
+    return RedirectResponse(url=deny_url, status_code=303)
 
 
 @app.post("/oauth/token", tags=["OAuth"])
@@ -1031,7 +1317,7 @@ async def login_user(req: UserLoginRequest, response: Response, request: Request
         key="session",
         value=session_token,
         httponly=True,
-        secure=is_prod,
+        secure=_cookie_secure(app_state.config),
         samesite="strict" if is_prod else "lax",
         max_age=86400,
         path="/",
@@ -1605,6 +1891,20 @@ async def install_backend(req: BackendInstallRequest, current_user: Dict = Depen
     if req.backend_type in ["api_rest", "api_graphql"] and "base_url" not in req.config:
         raise HTTPException(status_code=400, detail=f"{req.backend_type} backends require 'base_url' in config")
     
+    # SSRF validation (issue #4): remote backend URLs must not target
+    # private/link-local/metadata addresses or non-https schemes.
+    from security.ssrf import validate_backend_url
+    for url_field in ("url", "base_url"):
+        url_value = req.config.get(url_field)
+        if url_value is None:
+            continue
+        url_ok, url_reason = validate_backend_url(str(url_value))
+        if not url_ok:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Backend URL rejected by SSRF policy: {url_reason}",
+            )
+    
     # Save to database
     save_installed_backend(
         backend_id=req.backend_id,
@@ -1941,8 +2241,22 @@ async def liveness():
 
 @app.get("/ready", tags=["Info"])
 async def readiness():
-    """Readiness probe — all backends connected and healthy."""
+    """
+    Readiness probe — backends plus backing services.
+
+    Deep checks:
+    - SQLite: the gateway database can be opened and queried
+    - Redis: pinged only when RELAY_DATABASE__REDIS_URL is configured;
+      when not configured it is reported as not-applicable (ok)
+    - Backends: at least one healthy backend unless none are registered
+
+    Returns 200 with ``ready: true`` only when every applicable check passes,
+    503 with a ``degraded`` list naming the failing checks otherwise.
+    """
     app_state = _get_state()
+    checks: Dict[str, Dict[str, Any]] = {}
+
+    # --- Backends ---------------------------------------------------------
     backends_info = app_state.backends.list_backends()
     backends_healthy = sum(1 for b in backends_info if b["status"] == "healthy")
     backends_total = len(backends_info)
@@ -1950,18 +2264,63 @@ async def readiness():
         1 for b in backends_info
         if b.get("circuit_breaker", {}).get("state") == "open"
     )
+    checks["backends"] = {
+        "ok": backends_total == 0 or (backends_healthy > 0 and circuit_open == 0),
+        "healthy": backends_healthy,
+        "total": backends_total,
+        "circuit_open": circuit_open,
+    }
 
-    ready = backends_total == 0 or (backends_healthy > 0 and circuit_open == 0)
+    # --- SQLite openability ----------------------------------------------
+    # Skipped (reported ok) when a non-SQLite RELAY_DATABASE__URL is set and
+    # there is no database file to open-probe.
+    db_path = _sqlite_db_path(app_state)
+    sqlite_error: Optional[str] = None
+    if db_path is not None:
+        try:
+            conn = sqlite3.connect(db_path, timeout=2)
+            try:
+                conn.execute("SELECT 1")
+            finally:
+                conn.close()
+        except sqlite3.Error as exc:
+            sqlite_error = str(exc) or type(exc).__name__
+    sqlite_check: Dict[str, Any] = {"ok": sqlite_error is None}
+    if db_path is None:
+        sqlite_check["skipped"] = "non-sqlite database URL configured"
+    if sqlite_error is not None:
+        sqlite_check["error"] = sqlite_error
+    checks["sqlite"] = sqlite_check
+
+    # --- Redis ping (only when configured) --------------------------------
+    redis_url = app_state.config.database.redis_url
+    redis_check: Dict[str, Any] = {"configured": bool(redis_url), "ok": True}
+    if redis_url:
+        redis_error: Optional[str] = None
+        try:
+            import redis as redis_lib
+            client = redis_lib.from_url(
+                redis_url,
+                decode_responses=True,
+                socket_connect_timeout=2,
+                socket_timeout=2,
+            )
+            client.ping()
+        except Exception as exc:  # noqa: BLE001 — any failure means "not ready"
+            redis_error = str(exc) or type(exc).__name__
+        redis_check["ok"] = redis_error is None
+        if redis_error is not None:
+            redis_check["error"] = redis_error
+    checks["redis"] = redis_check
+
+    ready = all(check["ok"] for check in checks.values())
+    degraded = [name for name, check in checks.items() if not check["ok"]]
+    content: Dict[str, Any] = {"ready": ready, "checks": checks}
+    if degraded:
+        content["degraded"] = degraded
     return JSONResponse(
         status_code=200 if ready else 503,
-        content={
-            "ready": ready,
-            "backends": {
-                "healthy": backends_healthy,
-                "total": backends_total,
-                "circuit_open": circuit_open,
-            },
-        },
+        content=content,
     )
 
 
@@ -2139,6 +2498,79 @@ async def discover_connectors():
 # API Key Authentication (Alternative to OAuth)
 # -----------------------------------------------------------------------------
 
+async def resolve_principal(request: Request) -> Optional[Dict[str, Any]]:
+    """
+    Resolve the caller's identity from (in order):
+      1. ``Authorization``/``ApiKey`` header carrying an OAuth bearer token
+         or DB-backed API key (``relay_...``)
+      2. Session cookie (web UI login)
+
+    An explicit credential header wins over an ambient browser cookie so
+    machine clients are never mis-attributed to a logged-in user.
+
+    Returns a principal dict (user_id, client_id, is_admin, auth_method)
+    or None when unauthenticated.
+    """
+    app_state = _get_state()
+
+    authorization = request.headers.get("Authorization") or request.headers.get("ApiKey")
+
+    if authorization:
+        token = authorization[7:] if authorization.startswith("Bearer ") else authorization
+        if token:
+            # DB-backed API key
+            if token.startswith("relay_"):
+                from auth.database import get_api_key
+                key_data = get_api_key(token)
+                if not key_data:
+                    return None
+                return {
+                    "user_id": key_data["user_id"],
+                    "username": None,
+                    "client_id": f"apikey:{key_data['name']}",
+                    "is_admin": False,
+                    "auth_method": "api_key",
+                }
+
+            # OAuth bearer token
+            user_info = app_state.oauth.validate_access_token(token)
+            if not user_info:
+                return None
+            from auth.database import is_user_admin
+            user_id = user_info.get("user_id")
+            return {
+                "user_id": user_id,
+                "username": user_info.get("username"),
+                "client_id": user_info.get("client_id", "unknown"),
+                "is_admin": bool(is_user_admin(user_id)),
+                "auth_method": "oauth",
+            }
+
+    # Session cookie fallback
+    session_user = get_user_from_session(request)
+    if session_user:
+        return {
+            "user_id": session_user["id"],
+            "username": session_user.get("username"),
+            "client_id": "session",
+            "is_admin": bool(session_user.get("is_admin")),
+            "auth_method": "session",
+        }
+
+    return None
+
+
+async def get_authenticated_principal(request: Request) -> Dict[str, Any]:
+    """FastAPI dependency: require any supported credential type."""
+    principal = await resolve_principal(request)
+    if not principal:
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required (session cookie, Bearer token, or API key)",
+        )
+    return principal
+
+
 async def get_current_user_api_key(
     request: Request,
     authorization: Optional[str] = None,
@@ -2149,8 +2581,10 @@ async def get_current_user_api_key(
     Supports:
     - Bearer token (OAuth access token)
     - ApiKey header (simple API key)
+    - DB-backed API keys (relay_...) created via POST /v1/api-keys
     
-    For API keys, the key IS the access token (created via OAuth register).
+    For API keys, the key IS the access token (created via OAuth register
+    or the api_keys table).
     """
     if not authorization:
         authorization = request.headers.get("Authorization") or request.headers.get("ApiKey")
@@ -2168,50 +2602,124 @@ async def get_current_user_api_key(
         # Treat as raw API key
         token = authorization
     
-    # Validate token
+    # Validate OAuth bearer token
     user_info = state.oauth.validate_access_token(token)
-    if not user_info:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    if user_info:
+        return user_info
+
+    # Fall back to DB-backed API key lookup (owner-scoped credential)
+    if token.startswith("relay_"):
+        from auth.database import get_api_key, update_api_key_last_used
+        key_data = get_api_key(token)
+        if key_data:
+            update_api_key_last_used(token)
+            return {
+                "user_id": key_data["user_id"],
+                "client_id": f"apikey:{key_data['name']}",
+                "scope": "mcp:tools",
+            }
     
-    return user_info
+    raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+
+class V1ApiKeyCreateRequest(BaseModel):
+    """Request body for POST /v1/api-keys."""
+    client_name: str
+    # Accepted for backward compatibility with the previous payload shape;
+    # redirect URIs are not used for DB-backed API keys.
+    redirect_uris: Optional[List[str]] = None
+    expires_days: Optional[int] = None
+
+
+def _mask_key(key: str) -> str:
+    """Return a non-secret prefix of an API key for listing responses."""
+    return key[:12] + "..." if len(key) > 12 else key
 
 
 @app.post("/v1/api-keys", tags=["API Keys"])
-async def create_api_key(
-    req: ClientRegistrationRequest,
+async def create_api_key_v1(
+    req: V1ApiKeyCreateRequest,
+    principal: Dict[str, Any] = Depends(get_authenticated_principal),
 ):
     """
-    Create a simple API key for programmatic access.
-    
-    This is a simplified flow for CLIs and SDKs that don't want OAuth:
-    1. Register with a name and callback URL
-    2. Get an API key (sk-...) immediately
-    3. Use the API key in Authorization: Bearer sk-... or ApiKey: sk-...
+    Create a DB-backed API key bound to the authenticated principal.
+
+    Requires authentication (session cookie, OAuth Bearer token, or an
+    existing API key). The key carries owner metadata and can be used as
+    ``Authorization: Bearer relay_...`` on /v1/* endpoints.
+
+    Example:
+        curl -X POST https://gateway/v1/api-keys \\
+          -H "Authorization: Bearer <session-or-oauth-token>" \\
+          -H "Content-Type: application/json" \\
+          -d '{"client_name": "my-cli"}'
     """
-    # Register as OAuth client
-    client = state.oauth.register_client(
-        client_name=req.client_name,
-        redirect_uris=req.redirect_uris or ["urn:ietf:wg:oauth:2.0:oob"],
-        is_confidential=False,  # Public client for API key flow
+    from auth.database import create_api_key
+
+    name = (req.client_name or "").strip()[:64] or "unnamed"
+    key = create_api_key(
+        user_id=principal["user_id"],
+        name=name,
+        expires_days=req.expires_days,
     )
-    
-    # Create an access token directly (bypass OAuth flow)
-    # The API key IS the access token
-    token_pair = state.oauth._create_token_pair(
-        client_id=client.client_id,
-        user_id=f"api-key-{client.client_name}",
-        scope="mcp:tools",
-    )
-    
+
+    if state.security.audit:
+        state.security.audit.log(
+            event_type="api_key_created",
+            client_id=principal.get("client_id", "unknown"),
+            user_id=principal["user_id"],
+            ip_address="unknown",
+            resource="api-keys",
+            action="create",
+            success=True,
+            details={"name": name, "auth_method": principal["auth_method"]},
+        )
+
     return {
-        "api_key": token_pair.access_token,
-        "client_id": client.client_id,
-        "client_name": client.client_name,
-        "expires_in": token_pair.expires_in,
-        "usage": {
-            "header": "Authorization: Bearer <api_key>",
-            "alt_header": "ApiKey: <api_key>",
+        "api_key": key,
+        "client_name": name,
+        "owner": {
+            "user_id": principal["user_id"],
+            "auth_method": principal["auth_method"],
         },
+        "usage": {
+            "header": f"Authorization: Bearer {key}",
+            "alt_header": f"ApiKey: {key}",
+        },
+    }
+
+
+@app.get("/v1/api-keys", tags=["API Keys"])
+async def list_api_keys_v1(
+    include_all: bool = False,
+    principal: Dict[str, Any] = Depends(get_authenticated_principal),
+):
+    """
+    List API keys. Non-admin callers see only their own keys; admins may
+    pass ``include_all=true`` to list every key with owner metadata.
+    Full key material is never returned by this endpoint.
+    """
+    from auth.database import list_api_keys, list_all_api_keys
+
+    if principal["is_admin"] and include_all:
+        rows = list_all_api_keys()
+    else:
+        rows = list_api_keys(principal["user_id"])
+
+    return {
+        "keys": [
+            {
+                "key_prefix": _mask_key(r["key"]),
+                "user_id": r["user_id"],
+                "name": r["name"],
+                "created_at": r["created_at"],
+                "expires_at": r["expires_at"],
+                "last_used_at": r["last_used_at"],
+                "is_active": r["is_active"],
+            }
+            for r in rows
+        ],
+        "scoped_to_owner": not (principal["is_admin"] and include_all),
     }
 
 
@@ -2307,6 +2815,77 @@ async def v1_batch_call(
     }
 
 
+# Per-user MCP forwarding
+#
+# Both endpoints below bridge an authenticated request into the per-connector
+# MCP ASGI app mounted at /mcp/{connector_name}. The mounted app sends its own
+# complete ASGI response, so we forward scope/receive/send verbatim (with a
+# rewritten path and injected x-user-id header).
+
+class _ForwardedResponse(Response):
+    """
+    No-op ASGI response: signals that the forwarded-to MCP app already sent
+    the real response. Subclassing Response keeps FastAPI from trying to
+    JSON-encode the return value; overriding ``__call__`` stops it from
+    emitting a second http.response.start on the wire.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(content=b"")
+
+    async def __call__(self, scope, receive, send):  # type: ignore[override]
+        return None
+
+
+def _find_mounted_connector_app(app, connector_name: str):
+    """Return the ASGI app mounted at /mcp/{connector_name}, or None."""
+    from starlette.routing import Mount
+    mount_path = f"/mcp/{connector_name}"
+    for route in app.routes:
+        if isinstance(route, Mount) and route.path == mount_path:
+            return route.app
+    return None
+
+
+async def _forward_to_connector_mcp(request: Request, user_id: str, connector_name: str):
+    """
+    Bridge the current request into the mounted connector MCP server.
+
+    Returns a _ForwardedResponse when the downstream app produced the response
+    (the normal case), or a JSONResponse for local error conditions (unknown
+    connector).
+    """
+    from fastapi.responses import JSONResponse
+
+    mounted_app = _find_mounted_connector_app(request.app, connector_name)
+    if mounted_app is None:
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"Connector MCP server not mounted: {connector_name}"},
+        )
+
+    # Modify scope: replace /user-mcp/... with /mcp so the mounted server sees
+    # its own route.
+    scope = dict(request.scope)
+    scope["path"] = "/mcp"
+
+    # Add user_id header for the MCP server to use
+    new_headers = [(k, v) for k, v in scope.get("headers", [])]
+    new_headers.append((b"x-user-id", user_id.encode()))
+    scope["headers"] = new_headers
+
+    await mounted_app(scope, request.receive, request._send)
+    return _ForwardedResponse()
+
+
+_LEGACY_PATH_KEYS_ENV = "RELAY_LEGACY_PATH_KEYS"
+
+
+def _legacy_path_keys_enabled() -> bool:
+    """Whether the credential-in-URL-path MCP route may serve requests."""
+    return os.getenv(_LEGACY_PATH_KEYS_ENV, "").strip().lower() in ("1", "true", "yes")
+
+
 @app.api_route("/user-mcp/{api_key}/{connector_name}/mcp", methods=["GET", "POST"], tags=["MCP Compatible"])
 async def per_user_mcp_endpoint(
     api_key: str,
@@ -2314,53 +2893,92 @@ async def per_user_mcp_endpoint(
     request: Request,
 ):
     """
-    Per-user MCP endpoint using API key authentication.
-    
-    The API key is in the URL path, identifying the user.
-    Forwards to the pre-mounted MCP server at /mcp/{connector_name}.
-    
-    Example: /user-mcp/relay_abc123/github/mcp
+    DEPRECATED legacy per-user MCP endpoint (API key in URL path).
+
+    Disabled by default. Set ``RELAY_LEGACY_PATH_KEYS=1`` to re-enable while
+    migrating clients to the header-authenticated route:
+
+        POST /user-mcp/{connector}/mcp
+        Authorization: Bearer relay_...
+
+    Bearer-equivalent credentials in URL paths leak into access logs, proxies,
+    and browser history; this route exists only as a migration aid.
     """
+    if not _legacy_path_keys_enabled():
+        logger.warning(
+            "Legacy path-key MCP endpoint is disabled; set RELAY_LEGACY_PATH_KEYS=1 "
+            "to enable. Clients should migrate to /user-mcp/{connector}/mcp with "
+            "an Authorization header."
+        )
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": (
+                    "This endpoint is disabled. Use /user-mcp/{connector}/mcp with "
+                    "'Authorization: Bearer <api_key>' instead. (Legacy path-key "
+                    "routes are gated behind RELAY_LEGACY_PATH_KEYS=1.)"
+                )
+            },
+        )
+
+    logger.warning(
+        "DEPRECATED: /user-mcp/{api_key}/... places credentials in URL paths "
+        "(access logs, proxies, history). Migrate to /user-mcp/%s/mcp with an "
+        "Authorization header.",
+        connector_name,
+    )
+
     from auth.database import get_api_key, update_api_key_last_used
-    
+
     # Validate API key
     key_data = get_api_key(api_key)
     if not key_data:
         return JSONResponse(status_code=401, content={"error": "Invalid API key"})
-    
+
     user_id = key_data["user_id"]
-    
+
     # Update last used
     update_api_key_last_used(api_key)
-    
-    # Find the mounted connector MCP server
-    mount_path = f"/mcp/{connector_name}"
-    mounted_app = None
-    
-    # Routes are of type Mount for mounted apps
-    from starlette.routing import Mount
-    for route in app.routes:
-        if isinstance(route, Mount) and route.path == mount_path:
-            mounted_app = route.app
-            break
-    
-    if mounted_app is None:
-        return JSONResponse(status_code=404, content={"error": f"Connector MCP server not mounted: {connector_name}"})
-    
-    # Modify scope: replace /user-mcp/{api_key}/{connector}/mcp with /mcp
-    scope = dict(request.scope)
-    scope["path"] = "/mcp"
-    
-    # Add user_id header for the MCP server to use
-    new_headers = [(k, v) for k, v in scope.get("headers", [])]
-    new_headers.append((b"x-user-id", user_id.encode()))
-    scope["headers"] = new_headers
-    
-    # Forward to the mounted MCP server
-    await mounted_app(scope, request.receive, request._send)
-    
-    # Return empty response (the ASGI app has already sent the response)
-    return Response(content="")
+
+    return await _forward_to_connector_mcp(request, user_id, connector_name)
+
+
+@app.api_route("/user-mcp/{connector_name}/mcp", methods=["GET", "POST"], tags=["MCP Compatible"])
+async def per_user_mcp_header_endpoint(
+    connector_name: str,
+    request: Request,
+):
+    """
+    Per-user MCP endpoint with the API key in the Authorization header.
+
+    Example:
+
+        curl -X POST https://gateway/user-mcp/github/mcp \\
+          -H "Authorization: Bearer relay_abc123" \\
+          -H "Content-Type: application/json" \\
+          -d '{"jsonrpc":"2.0","method":"tools/list","id":1}'
+    """
+    from auth.database import get_api_key, update_api_key_last_used
+
+    authorization = request.headers.get("Authorization") or ""
+    token = authorization[7:] if authorization.startswith("Bearer ") else authorization.strip()
+    if not token:
+        return JSONResponse(status_code=401, content={"error": "Missing API key"})
+
+    # Only DB-backed API keys are accepted here (relay_...); OAuth bearer
+    # tokens belong on /mcp/{connector}.
+    if not token.startswith("relay_"):
+        return JSONResponse(status_code=401, content={"error": "Invalid API key"})
+
+    key_data = get_api_key(token)
+    if not key_data:
+        return JSONResponse(status_code=401, content={"error": "Invalid API key"})
+
+    user_id = key_data["user_id"]
+    update_api_key_last_used(token)
+
+    return await _forward_to_connector_mcp(request, user_id, connector_name)
+
 
 
 @app.post("/mcp/connectors/{connector_name}/health", tags=["MCP Compatible"])
@@ -2389,6 +3007,9 @@ class ToolCallRequest(BaseModel):
     timeout: int = 120
 
 
+# Server-side ceiling for caller-supplied tool-call timeouts (seconds).
+MAX_TOOL_CALL_TIMEOUT = int(os.environ.get("RELAY_MAX_TOOL_CALL_TIMEOUT", "60"))
+
 async def _execute_tool(
     tool_name: str,
     arguments: Dict[str, Any],
@@ -2414,6 +3035,8 @@ async def _execute_tool(
     1. Look up a user-specific token in the TokenStore for the connector.
     2. Fall back to the shared env-var credential registered at startup.
     """
+    # Enforce server-side ceiling regardless of caller-supplied value.
+    timeout = min(max(1, int(timeout)), MAX_TOOL_CALL_TIMEOUT)
     allowed, info = state.security.check_request(
         client_id=user["client_id"],
         ip_address=ip,
@@ -2551,6 +3174,20 @@ async def _execute_tool(
         success=success,
         result_summary=str(result)[:200] if result else None,
     )
+
+    # DLP: scrub (or block) credential-shaped content before it reaches
+    # the caller / model context. Violations are audit-logged with a
+    # redacted preview. Disable by calling set_dlp_inspector(None) or
+    # installing a disabled inspector.
+    if success:
+        result = _dlp_enforce(result, tool_name=tool_name, user=user, ip=ip)
+        if result is None:
+            return False, {
+                "error": "Result blocked by data loss prevention policy",
+                "reason": "dlp_result_blocked",
+                "hint": "The tool result contained credential-shaped content "
+                        "and RELAY_SECURITY__RESULT_DLP_MODE=block is configured.",
+            }
 
     return success, result
 
@@ -3065,10 +3702,18 @@ def create_mcp_server(app_state: Optional["AppState"] = None, init_state: bool =
             )
         else:
             return json.dumps({"error": f"Tool '{tool_name}' not found in any backend or connector"})
-        
+
         if not success:
             return json.dumps({"error": result})
-        return json.dumps({"result": result})
+        # DLP: scrub (or block) credential-shaped content before returning
+        # to the caller. Violations are audit-logged with a redacted preview.
+        enforced = _dlp_enforce(result, tool_name=tool_name, user=user_info)
+        if enforced is None:
+            return json.dumps({
+                "error": "Result blocked by data loss prevention policy",
+                "reason": "dlp_result_blocked",
+            })
+        return json.dumps({"result": enforced})
     
     # --- Gateway management tools ---
     
@@ -3202,144 +3847,157 @@ def create_connector_mcp_server(
         instructions=f"{connector.display_name}: {connector.description}",
     )
 
-    for tool_def in tools:
-        tool_name = tool_def.name
-        tool_desc = tool_def.description
-        tool_params = tool_def.parameters
 
-        schema_params = tool_params.get("properties", {})
-        required = tool_params.get("required", [])
+def _build_mcp_tool_handler(
+    *,
+    connector_name: str,
+    tool_def,
+    app_state,
+    fixed_user_token: Optional[str] = None,
+):
+    """Build an MCP tool handler as a closure.
 
-        params = []
-        for pname in schema_params:
-            if pname in required:
-                params.append(f"{pname}: str")
-        for pname in schema_params:
-            if pname not in required:
-                params.append(f"{pname}: Optional[str] = None")
-        if params:
-            params_str = ", ".join(params) + ", ctx: Context = None"
+    Replaces the previous dynamic source-generation approach: no dynamic source
+    compilation, and credentials are never interpolated into function
+    source. The handler exposes an explicit __signature__ so FastMCP schema
+    generation continues to work.
+    """
+    import inspect
+
+    tool_name = tool_def.name
+    param_props = (tool_def.parameters or {}).get("properties", {})
+    required = set((tool_def.parameters or {}).get("required", []))
+    param_names = list(param_props.keys())
+
+    async def handler(**kwargs) -> str:
+        ctx = kwargs.pop("ctx", None)
+        call_args = {k: v for k, v in kwargs.items() if k in param_names and v is not None}
+
+        user_id = None
+        if fixed_user_token is not None:
+            user_token = fixed_user_token
+            if not user_token:
+                return json.dumps({
+                    "error": f"No credentials for '{connector_name}'",
+                    "hint": f"Connect your account at /oauth/authorize/{connector_name}",
+                })
         else:
-            params_str = "ctx: Context = None"
-
-        fn_code = f"""
-async def tool_fn({params_str}) -> str:
-    _tool_param_names = {list(schema_params.keys())}
-    kwargs = {{k: v for k, v in locals().items() if k in _tool_param_names and v is not None}}
-
-    # Try to get authorization from MCP request context
-    auth_val = None
-    api_key = None
-    user_id = None
-    try:
-        if ctx is not None and ctx.request_context is not None:
-            req = ctx.request_context.request
-            if req is not None:
-                auth_val = req.headers.get("Authorization")
-                api_key = req.headers.get("X-API-Key")
-                user_id = req.headers.get("X-User-Id")
-    except Exception:
-        pass
-
-    user_token = None
-    
-    # First try X-User-Id header (set by per-user MCP endpoint)
-    if user_id:
-        try:
-            from auth.token_store import get_token_store
-            user_token = await get_token_store().get_token(user_id, "{connector_name}")
-        except Exception:
-            pass
-    
-    # Then try API key header
-    if not user_token and api_key:
-        try:
-            from auth.database import get_api_key
-            key_data = get_api_key(api_key)
-            if key_data:
-                user_id = key_data["user_id"]
-                from auth.token_store import get_token_store
-                user_token = await get_token_store().get_token(user_id, "{connector_name}")
-        except Exception:
-            pass
-    
-    # Then try JWT auth
-    if not user_token and auth_val:
-        token = auth_val[7:] if auth_val.startswith("Bearer ") else auth_val
-        user_info = app_state.oauth.validate_access_token(token)
-        if user_info:
-            user_id = user_info.get("user_id")
+            auth_val = None
+            api_key = None
+            header_user_id = None
             try:
-                from auth.token_store import get_token_store
-                user_token = await get_token_store().get_token(user_id, "{connector_name}")
+                if ctx is not None and getattr(ctx, "request_context", None) is not None:
+                    req = ctx.request_context.request
+                    if req is not None:
+                        auth_val = req.headers.get("Authorization")
+                        api_key = req.headers.get("X-API-Key")
+                        header_user_id = req.headers.get("X-User-Id")
             except Exception:
                 pass
 
-    # Check granular access permissions
-    if user_id:
-        try:
-            from auth.database import check_user_tool_access
-            if not check_user_tool_access(user_id, "{connector_name}", "{tool_name}"):
-                return json.dumps({{
-                    "error": "Access denied",
-                    "hint": "You don't have permission to use this tool. Request access at http://localhost:8000/access-requests",
-                }})
-        except Exception:
-            pass
+            user_token = None
+            if header_user_id:
+                user_id = header_user_id
+                try:
+                    from auth.token_store import get_token_store
+                    user_token = await get_token_store().get_token(user_id, connector_name)
+                except Exception:
+                    pass
+            if not user_token and api_key:
+                try:
+                    from auth.database import get_api_key
+                    key_data = get_api_key(api_key)
+                    if key_data:
+                        user_id = key_data["user_id"]
+                        from auth.token_store import get_token_store
+                        user_token = await get_token_store().get_token(user_id, connector_name)
+                except Exception:
+                    pass
+            if not user_token and auth_val:
+                token = auth_val[7:] if auth_val.startswith("Bearer ") else auth_val
+                user_info = app_state.oauth.validate_access_token(token)
+                if user_info:
+                    user_id = user_info.get("user_id")
+                    try:
+                        from auth.token_store import get_token_store
+                        user_token = await get_token_store().get_token(user_id, connector_name)
+                    except Exception:
+                        pass
 
-    # Patroclus authorization check
-    if app_state.patroclus and app_state.patroclus.enabled and user_id:
-        _decision, _reason = await app_state.patroclus.check_access(
-            agent_id=user_id,
-            action="call",
-            resource="{connector_name}/{{tool_name}}",
-            requested_scopes=["{connector_name}:{{tool_name}}"],
+            # Granular per-user/per-tool permissions.
+            if user_id:
+                try:
+                    from auth.database import check_user_tool_access
+                    if not check_user_tool_access(user_id, connector_name, tool_name):
+                        return json.dumps({
+                            "error": "Access denied",
+                            "hint": "You don't have permission to use this tool.",
+                        })
+                except Exception:
+                    pass
+
+            # Patroclus authorization check.
+            if app_state.patroclus and app_state.patroclus.enabled and user_id:
+                _decision, _reason = await app_state.patroclus.check_access(
+                    agent_id=user_id,
+                    action="call",
+                    resource=f"{connector_name}/{tool_name}",
+                    requested_scopes=[f"{connector_name}:{tool_name}"],
+                )
+                if _decision in ("deny", "require_approval"):
+                    return json.dumps({
+                        "error": "Access denied by Patroclus policy"
+                        if _decision == "deny"
+                        else "Approval required by Patroclus policy",
+                        "reason": _reason,
+                    })
+
+            requires_auth = bool(getattr(tool_def, "requires_auth", False))
+            if requires_auth and not user_token:
+                return json.dumps({
+                    "error": f"No credentials for '{connector_name}'",
+                    "hint": f"Connect your account at /oauth/authorize/{connector_name}",
+                })
+
+        success, result = await app_state.connectors.call_tool(
+            tool_name=tool_name,
+            arguments=call_args,
+            user_token=user_token,
         )
-        if _decision == "deny":
-            return json.dumps({{
-                "error": "Access denied by Patroclus policy",
-                "reason": _reason,
-            }})
-        if _decision == "require_approval":
-            return json.dumps({{
-                "error": "Approval required by Patroclus policy",
-                "reason": _reason,
-            }})
+        if not success:
+            return json.dumps({"error": result})
+        # DLP: scrub (or block) credential-shaped content before returning
+        # to the caller. Violations are audit-logged with a redacted preview.
+        enforced = _dlp_enforce(result, tool_name=tool_name, user=user_info)
+        if enforced is None:
+            return json.dumps({
+                "error": "Result blocked by data loss prevention policy",
+                "reason": "dlp_result_blocked",
+            })
+        return json.dumps({"result": enforced})
 
-    requires_auth = {tool_def.requires_auth}
-    if requires_auth and not user_token:
-        return json.dumps({{
-            "error": f"No credentials for '{connector_name}'",
-            "hint": "Connect your account at http://localhost:8000/oauth/authorize/{connector_name}",
-        }})
-
-    success, result = await app_state.connectors.call_tool(
-        tool_name="{tool_name}",
-        arguments=kwargs,
-        user_token=user_token,
+    sig_params = []
+    for pname in param_names:
+        annotation = str if pname in required else Optional[str]
+        default = inspect.Parameter.empty if pname in required else None
+        sig_params.append(
+            inspect.Parameter(pname, inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=annotation, default=default)
+        )
+    sig_params.append(
+        inspect.Parameter("ctx", inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=Optional[Any], default=None)
     )
+    handler.__signature__ = inspect.Signature(sig_params)
+    handler.__name__ = tool_name
+    handler.__doc__ = tool_def.description
+    return handler
 
-    if not success:
-        return json.dumps({{"error": result}})
-    return json.dumps({{"result": result}})
-"""
-        local_ns: Dict[str, Any] = {
-            "app_state": app_state,
-            "json": json,
-            "Optional": Optional,
-            "Context": None,
-        }
-        try:
-            from mcp.server.fastmcp import Context
-            local_ns["Context"] = Context
-        except ImportError:
-            pass
 
-        exec(fn_code, local_ns, local_ns)
-        tool_fn = local_ns["tool_fn"]
-        tool_fn.__name__ = tool_name
-        tool_fn.__doc__ = tool_desc
-
+    for tool_def in tools:
+        tool_fn = _build_mcp_tool_handler(
+            connector_name=connector_name,
+            tool_def=tool_def,
+            app_state=app_state,
+        )
         mcp.tool()(tool_fn)
 
     # Add resources
@@ -3433,70 +4091,12 @@ def create_connector_mcp_server_with_auth(
     # This avoids async event loop issues
 
     for tool_def in tools:
-        tool_name = tool_def.name
-        tool_desc = tool_def.description
-        tool_params = tool_def.parameters
-
-        schema_params = tool_params.get("properties", {})
-        required = tool_params.get("required", [])
-
-        params = []
-        for pname in schema_params:
-            if pname in required:
-                params.append(f"{pname}: str")
-        for pname in schema_params:
-            if pname not in required:
-                params.append(f"{pname}: Optional[str] = None")
-        if params:
-            params_str = ", ".join(params) + ", ctx: Context = None"
-        else:
-            params_str = "ctx: Context = None"
-
-        # Capture user_token in closure
-        _user_token = user_token
-        _connector_name = connector_name
-
-        fn_code = f"""
-async def tool_fn({params_str}) -> str:
-    _tool_param_names = {list(schema_params.keys())}
-    kwargs = {{k: v for k, v in locals().items() if k in _tool_param_names and v is not None}}
-
-    user_token = "{_user_token or ''}"
-    
-    if not user_token:
-        return json.dumps({{
-            "error": f"No credentials for '{_connector_name}'",
-            "hint": "Connect your account at http://localhost:8000/oauth/authorize/{_connector_name}",
-        }})
-
-    success, result = await app_state.connectors.call_tool(
-        tool_name="{tool_name}",
-        arguments=kwargs,
-        user_token=user_token,
-    )
-
-    if not success:
-        return json.dumps({{"error": result}})
-    return json.dumps({{"result": result}})
-"""
-        local_ns: Dict[str, Any] = {
-            "app_state": app_state,
-            "json": json,
-            "Optional": Optional,
-            "Context": None,
-            "asyncio": asyncio,
-        }
-        try:
-            from mcp.server.fastmcp import Context
-            local_ns["Context"] = Context
-        except ImportError:
-            pass
-
-        exec(fn_code, local_ns, local_ns)
-        tool_fn = local_ns["tool_fn"]
-        tool_fn.__name__ = tool_name
-        tool_fn.__doc__ = tool_desc
-
+        tool_fn = _build_mcp_tool_handler(
+            connector_name=connector_name,
+            tool_def=tool_def,
+            app_state=app_state,
+            fixed_user_token=user_token,
+        )
         mcp.tool()(tool_fn)
 
     # Add resources

@@ -137,12 +137,15 @@
 <pre><code>{
   "mcpServers": {
     "relay-{{ connector.name }}": {
-      "url": "http://localhost:8000/user-mcp/{{ api_key }}/{{ connector.name }}/mcp"
+      "url": "http://localhost:8000/user-mcp/{{ connector.name }}/mcp",
+      "headers": {
+        "Authorization": "Bearer {{ api_key }}"
+      }
     }
   }
 }</code></pre>
                     </div>
-                    <button class="btn btn-sm copy-btn" data-copy='{"mcpServers": {"relay-{{ connector.name }}": {"url": "http://localhost:8000/user-mcp/{{ api_key }}/{{ connector.name }}/mcp"}}}'>Copy Config</button>
+                    <button class="btn btn-sm copy-btn" data-copy='{"mcpServers": {"relay-{{ connector.name }}": {"url": "http://localhost:8000/user-mcp/{{ connector.name }}/mcp", "headers": {"Authorization": "Bearer {{ api_key }}"}}}}'>Copy Config</button>
                 </div>
             </div>
             
@@ -157,12 +160,15 @@
 <pre><code>{
   "mcpServers": {
     "relay-{{ connector.name }}": {
-      "url": "http://localhost:8000/user-mcp/{{ api_key }}/{{ connector.name }}/mcp"
+      "url": "http://localhost:8000/user-mcp/{{ connector.name }}/mcp",
+      "headers": {
+        "Authorization": "Bearer {{ api_key }}"
+      }
     }
   }
 }</code></pre>
                     </div>
-                    <button class="btn btn-sm copy-btn" data-copy='{"mcpServers": {"relay-{{ connector.name }}": {"url": "http://localhost:8000/user-mcp/{{ api_key }}/{{ connector.name }}/mcp"}}}'>Copy Config</button>
+                    <button class="btn btn-sm copy-btn" data-copy='{"mcpServers": {"relay-{{ connector.name }}": {"url": "http://localhost:8000/user-mcp/{{ connector.name }}/mcp", "headers": {"Authorization": "Bearer {{ api_key }}"}}}}'>Copy Config</button>
                 </div>
             </div>
             
@@ -176,9 +182,11 @@
                     <div class="code-block">
 <pre><code>mcpServers:
   relay-{{ connector.name }}:
-    url: http://localhost:8000/mcp/user/{{ api_key }}/{{ connector.name }}/mcp</code></pre>
+    url: http://localhost:8000/user-mcp/{{ connector.name }}/mcp
+    headers:
+      Authorization: Bearer {{ api_key }}</code></pre>
                     </div>
-                    <button class="btn btn-sm copy-btn" data-copy="mcpServers:\n  relay-{{ connector.name }}:\n    url: http://localhost:8000/mcp/user/{{ api_key }}/{{ connector.name }}/mcp">Copy Config</button>
+                    <button class="btn btn-sm copy-btn" data-copy='mcpServers:\n  relay-{{ connector.name }}:\n    url: http://localhost:8000/user-mcp/{{ connector.name }}/mcp\n    headers:\n      Authorization: Bearer {{ api_key }}'>Copy Config</button>
                 </div>
             </div>
             
@@ -194,13 +202,16 @@
   "mcp": {
     "servers": {
       "relay-{{ connector.name }}": {
-        "url": "http://localhost:8000/user-mcp/{{ api_key }}/{{ connector.name }}/mcp"
+        "url": "http://localhost:8000/user-mcp/{{ connector.name }}/mcp",
+        "headers": {
+          "Authorization": "Bearer {{ api_key }}"
+        }
       }
     }
   }
 }</code></pre>
                     </div>
-                    <button class="btn btn-sm copy-btn" data-copy='{"mcp": {"servers": {"relay-{{ connector.name }}": {"url": "http://localhost:8000/user-mcp/{{ api_key }}/{{ connector.name }}/mcp"}}}'>Copy Config</button>
+                    <button class="btn btn-sm copy-btn" data-copy='{"mcp": {"servers": {"relay-{{ connector.name }}": {"url": "http://localhost:8000/user-mcp/{{ connector.name }}/mcp", "headers": {"Authorization": "Bearer {{ api_key }}"}}}}'>Copy Config</button>
                 </div>
             </div>
         </div>
