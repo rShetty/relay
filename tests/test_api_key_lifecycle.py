@@ -149,6 +149,8 @@ class TestLastUsedTracking:
 
 def _current_user_id(client):
     """Resolve the logged-in user's id from the session (or DB fallback)."""
+    from auth import database as db
+
     me = client.get("/auth/me")
     if me.status_code == 200:
         return me.json()["id"]
