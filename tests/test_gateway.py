@@ -1480,8 +1480,7 @@ class TestConnectorMcpRegistration:
         return srv, fake_connector, fake_mcp, captured
 
     def test_tools_and_resources_registered(self, monkeypatch):
-        if pytest.importorskip("mcp") is None:
-            return
+        pytest.importorskip("mcp.server.fastmcp")
         from gateway import server as srv
 
         registered = []
