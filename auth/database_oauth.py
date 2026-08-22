@@ -78,7 +78,7 @@ class DatabaseOAuthProvider(OAuthProvider):
         logger.info(f"Registered OAuth client: {client_name} ({client_id[:12]}...)")
         
         # Store secret in client for later use (not persisted in client object)
-        client._client_secret = client_secret
+        object.__setattr__(client, "_client_secret", client_secret)
         
         return client
     
@@ -119,7 +119,7 @@ class DatabaseOAuthProvider(OAuthProvider):
         self,
         client_id: str,
         redirect_uri: str,
-        code_challenge: str = None,
+        code_challenge: Optional[str] = None,
         code_challenge_method: str = "S256",
         scope: Optional[str] = "mcp:tools",
         user_id: Optional[str] = None,
@@ -201,20 +201,22 @@ class DatabaseOAuthProvider(OAuthProvider):
             user_id=user_id,
             client_id=client_id,
             access_token=access_token,
-            refresh_token=refresh_token,
+            refresh_token=refresh_token or "",
             expires_at=expires_at.isoformat(),
             scope=scope,
         )
         
         return TokenPair(
             access_token=access_token,
-            refresh_token=refresh_token,
+            refresh_token=refresh_token or "",
             expires_in=self.jwt.access_token_expire_minutes * 60,
             token_type="Bearer",
             scope=scope or "mcp:tools",
         )
     
-    def validate_access_token(self, token: str) -> Optional[Dict[str, Any]]:
+    def validate_access_token(
+        self, token: str, required_scopes: Optional[List[str]] = None
+    ) -> Optional[Dict[str, Any]]:
         """Validate access token."""
         # Use parent's JWT validation
         payload = self.jwt.decode_token(token)
@@ -320,7 +322,7 @@ class DatabaseTokenStore:
             connector_name=connector_name,
             token=token,
             token_type=token_type,
-            refresh_token=refresh_token,
+            refresh_token=refresh_token or "",
             expires_at=expires_at,
             metadata=metadata,
         )

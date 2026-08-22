@@ -3848,6 +3848,47 @@ def create_connector_mcp_server(
     )
 
 
+    for tool_def in tools:
+        tool_fn = _build_mcp_tool_handler(
+            connector_name=connector_name,
+            tool_def=tool_def,
+            app_state=app_state,
+        )
+        mcp.tool()(tool_fn)
+
+    # Add resources
+    resources = connector.get_resources()
+    for resource in resources:
+        resource_uri = resource.uri
+        resource_name = resource.name
+        resource_desc = resource.description
+        
+        @mcp.resource(resource_uri)
+        async def resource_handler() -> str:
+            result = await connector.read_resource(resource_uri)
+            return json.dumps(result) if result else "{}"
+        
+        resource_handler.__name__ = resource_name
+        resource_handler.__doc__ = resource_desc
+    
+    # Add prompts
+    prompts = connector.get_prompts()
+    for prompt in prompts:
+        prompt_name = prompt.name
+        prompt_desc = prompt.description
+        prompt_template = prompt.template
+        
+        @mcp.prompt(name=prompt_name)
+        def prompt_handler(**kwargs) -> str:
+            result = prompt_template
+            for key, value in kwargs.items():
+                result = result.replace(f"{{{key}}}", str(value))
+            return result
+        
+        prompt_handler.__doc__ = prompt_desc
+    
+    return mcp
+
 def _build_mcp_tool_handler(
     *,
     connector_name: str,
@@ -3991,49 +4032,6 @@ def _build_mcp_tool_handler(
     handler.__doc__ = tool_def.description
     return handler
 
-
-    for tool_def in tools:
-        tool_fn = _build_mcp_tool_handler(
-            connector_name=connector_name,
-            tool_def=tool_def,
-            app_state=app_state,
-        )
-        mcp.tool()(tool_fn)
-
-    # Add resources
-    resources = connector.get_resources()
-    for resource in resources:
-        resource_uri = resource.uri
-        resource_name = resource.name
-        resource_desc = resource.description
-        
-        @mcp.resource(resource_uri)
-        async def resource_handler() -> str:
-            result = await connector.read_resource(resource_uri)
-            return json.dumps(result) if result else "{}"
-        
-        resource_handler.__name__ = resource_name
-        resource_handler.__doc__ = resource_desc
-    
-    # Add prompts
-    prompts = connector.get_prompts()
-    for prompt in prompts:
-        prompt_name = prompt.name
-        prompt_desc = prompt.description
-        prompt_template = prompt.template
-        
-        @mcp.prompt(name=prompt_name)
-        def prompt_handler(**kwargs) -> str:
-            result = prompt_template
-            for key, value in kwargs.items():
-                result = result.replace(f"{{{key}}}", str(value))
-            return result
-        
-        prompt_handler.__doc__ = prompt_desc
-    
-    return mcp
-
-
 def create_connector_mcp_server_with_auth(
     connector_name: str,
     user_token: Optional[str] = None,
@@ -4086,10 +4084,6 @@ def create_connector_mcp_server_with_auth(
         f"gateway-{connector_name}",
         instructions=f"{connector.display_name}: {connector.description}",
     )
-
-    # Use the provided user_token (already fetched in the endpoint)
-    # This avoids async event loop issues
-
     for tool_def in tools:
         tool_fn = _build_mcp_tool_handler(
             connector_name=connector_name,
@@ -4131,6 +4125,8 @@ def create_connector_mcp_server_with_auth(
         prompt_handler.__doc__ = prompt_desc
     
     return mcp
+
+
     """
     Create an MCP server that proxies directly to a specific MCP backend.
     

@@ -1025,7 +1025,7 @@ def get_all_user_permissions() -> Dict[str, List[Dict[str, Any]]]:
         "SELECT * FROM connector_permissions ORDER BY user_id, connector_name"
     ).fetchall()
     
-    result = {}
+    result: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
         user_id = row["user_id"]
         if user_id not in result:
@@ -1098,7 +1098,9 @@ def create_access_request(
         VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)
     """, (user_id, connector_name, tools_json, reason, now, now, now))
     conn.commit()
-    return cursor.lastrowid
+    last = cursor.lastrowid
+    assert last is not None, "insert did not yield a rowid"
+    return int(last)
 
 
 def get_access_request(request_id: int) -> Optional[Dict[str, Any]]:

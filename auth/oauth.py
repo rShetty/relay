@@ -176,7 +176,7 @@ class JWTManager:
             redis_url: Redis connection URL, e.g. ``redis://localhost:6379``.
         """
         try:
-            import redis as redis_lib  # type: ignore[import]
+            import redis as redis_lib
             client = redis_lib.from_url(redis_url, decode_responses=True, socket_timeout=2)
             client.ping()
             self._redis = client

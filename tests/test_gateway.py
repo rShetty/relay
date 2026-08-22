@@ -1409,3 +1409,152 @@ class TestUserAuth:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestConnectorMcpRegistration:
+    """Regression: create_connector_mcp_server must register tools/resources/prompts.
+
+    Guards against the factory refactor that accidentally truncated both
+    builder functions (empty MCP servers returned).
+    """
+
+    def _build(self, monkeypatch):
+        mcp = pytest.importorskip("mcp.server.fastmcp")
+        from gateway import server as srv
+
+        class FakeToolDef:
+            name = "list_issues"
+            description = "List issues"
+            parameters = {"properties": {"state": {"type": "string"}}, "required": []}
+            requires_auth = False
+
+        class FakeConnector:
+            display_name = "GitHub"
+            description = "GitHub connector"
+
+            def get_tools(self):
+                return [FakeToolDef()]
+
+            def get_resources(self):
+                return []
+
+            def get_prompts(self):
+                return []
+
+        fake_connector = FakeConnector()
+        captured = {}
+
+        class FakeFastMCP:
+            def __init__(self, name, instructions=None):
+                captured["name"] = name
+                self.registered = []
+
+            def tool(self):
+                def deco(fn):
+                    self.registered.append(("tool", fn.__name__))
+                    return fn
+                return deco
+
+            def resource(self, uri):
+                def deco(fn):
+                    self.registered.append(("resource", uri))
+                    return fn
+                return deco
+
+            def prompt(self, name=None):
+                def deco(fn):
+                    self.registered.append(("prompt", name))
+                    return fn
+                return deco
+
+        fake_mcp = FakeFastMCP()
+        monkeypatch.setattr(srv, "create_connector_mcp_server", srv.create_connector_mcp_server, raising=True)
+        # Patch FastMCP inside the function's import scope.
+        import types
+        real_import = __import__
+
+        orig_server_source = None  # noqa
+        monkeypatch.setattr(
+            "mcp.server.fastmcp.FastMCP", FakeFastMCP, raising=True
+        )
+        return srv, fake_connector, fake_mcp, captured
+
+    def test_tools_and_resources_registered(self, monkeypatch):
+        pytest.importorskip("mcp.server.fastmcp")
+        from gateway import server as srv
+
+        registered = []
+        resources_requested = []
+        prompts_requested = []
+
+        class FakeToolDef:
+            name = "list_issues"
+            description = "d"
+            parameters = {"properties": {}, "required": []}
+            requires_auth = False
+
+        class FakeResource:
+            uri = "github://issues"
+            name = "issues"
+            description = "Issues"
+
+        class FakePrompt:
+            name = "review_pr"
+            description = "Review a PR"
+            template = "Review {repo}#{number}"
+
+        class FakeConnector:
+            display_name = "GitHub"
+            description = "GitHub"
+
+            def get_tools(self):
+                return [FakeToolDef()]
+
+            def get_resources(self):
+                return [FakeResource()]
+
+            def get_prompts(self):
+                return [FakePrompt()]
+
+        class FakeRegistry:
+            def __init__(self):
+                self.items = []
+            def tool(self):
+                def deco(fn):
+                    self.items.append(("tool", fn.__name__))
+                    return fn
+                return deco
+            def resource(self, uri):
+                def deco(fn):
+                    self.items.append(("resource", uri))
+                    return fn
+                return deco
+            def prompt(self, name=None):
+                def deco(fn):
+                    self.items.append(("prompt", name))
+                    return fn
+                return deco
+
+        registry = FakeRegistry()
+
+        class FakeAppState:
+            patroclus = None
+            class connectors:
+                @staticmethod
+                def get_connector(name):
+                    return FakeConnector()
+
+        # Monkeypatch FastMCP used inside the function under test.
+        import mcp.server.fastmcp as fastmcp_mod
+        orig_fastmcp = fastmcp_mod.FastMCP
+        fastmcp_mod.FastMCP = lambda name, instructions=None: registry
+        try:
+            result = srv.create_connector_mcp_server("github", FakeAppState())
+        finally:
+            fastmcp_mod.FastMCP = orig_fastmcp
+
+        assert result is registry, "builder must return the FastMCP instance"
+        kinds = [k for k, _ in registry.items]
+        assert ("tool", "list_issues") in registry.items or any(k == "tool" for k, _ in registry.items)
+        assert any(k == "resource" for k, _ in registry.items), "resources lost"
+        assert any(k == "prompt" for k, _ in registry.items), "prompts lost"

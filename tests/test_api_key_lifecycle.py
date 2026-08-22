@@ -149,10 +149,14 @@ class TestLastUsedTracking:
 
 def _current_user_id(client):
     """Resolve the logged-in user's id from the session (or DB fallback)."""
+    from auth import database as db
+
     me = client.get("/auth/me")
     if me.status_code == 200:
         return me.json()["id"]
     row = db.get_user_by_username("lifecycle_lastused_user")
+    if row is None:
+        raise RuntimeError("lifecycle user missing from database")
     return row["id"]
 
 
