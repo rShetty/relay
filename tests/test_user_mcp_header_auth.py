@@ -158,7 +158,9 @@ def test_header_route_forwards_with_bearer_key(env):
     assert stub.scopes[0]["path"] == "/mcp"
 
     from auth.database import get_user_by_username
-    user_id = get_user_by_username(username)["id"]
+    _user = get_user_by_username(username)
+    assert _user is not None, f"user {username} missing"
+    user_id = _user["id"]
     sent_headers = {k.decode().lower(): v.decode() for k, v in stub.scopes[0]["headers"]}
     assert sent_headers["x-user-id"] == user_id
 
@@ -278,7 +280,9 @@ def test_legacy_route_enabled_by_flag_forwards(env):
     assert stub.scopes[0]["path"] == "/mcp"
 
     from auth.database import get_user_by_username
-    user_id = get_user_by_username(username)["id"]
+    _user = get_user_by_username(username)
+    assert _user is not None, f"user {username} missing"
+    user_id = _user["id"]
     sent_headers = {k.decode().lower(): v.decode() for k, v in stub.scopes[0]["headers"]}
     assert sent_headers["x-user-id"] == user_id
 

@@ -153,6 +153,8 @@ def _current_user_id(client):
     if me.status_code == 200:
         return me.json()["id"]
     row = db.get_user_by_username("lifecycle_lastused_user")
+    if row is None:
+        raise RuntimeError("lifecycle user missing from database")
     return row["id"]
 
 
