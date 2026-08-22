@@ -20,6 +20,12 @@ spec:
         - name: relay
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
           ports:
             - containerPort: {{ .Values.server.port }}
               protocol: TCP
@@ -77,17 +83,22 @@ spec:
             periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
-          {{- if .Values.persistence.enabled }}
           volumeMounts:
+            - name: tmp
+              mountPath: /tmp
             - name: data
               mountPath: /app/data
-          {{- end }}
-      {{- if .Values.persistence.enabled }}
       volumes:
+        - name: tmp
+          emptyDir: {}
+        {{- if .Values.persistence.enabled }}
         - name: data
           persistentVolumeClaim:
             claimName: {{ .Release.Name }}-data
-      {{- end }}
+        {{- else }}
+        - name: data
+          emptyDir: {}
+        {{- end }}
 ---
 {{- if .Values.autoscaling.enabled }}
 apiVersion: autoscaling/v2
