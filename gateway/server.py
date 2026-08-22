@@ -576,7 +576,8 @@ async def lifespan(app: FastAPI):
     )
     
     # Mount per-connector MCP servers on /mcp/{connector}
-    # Note: This is for shared/default tokens. For per-user MCP, use /user-mcp/{api_key}/{connector}/mcp
+    # Note: This is for shared/default tokens. For per-user MCP, use /user-mcp/{connector}/mcp
+    # with an Authorization header (see per_user_mcp_header_endpoint below).
     connector_session_managers = []
     for conn_name in ConnectorRegistry.CONNECTOR_TYPES:
         connector_mcp = create_connector_mcp_server(conn_name, app_state=state)
@@ -2814,6 +2815,77 @@ async def v1_batch_call(
     }
 
 
+# Per-user MCP forwarding
+#
+# Both endpoints below bridge an authenticated request into the per-connector
+# MCP ASGI app mounted at /mcp/{connector_name}. The mounted app sends its own
+# complete ASGI response, so we forward scope/receive/send verbatim (with a
+# rewritten path and injected x-user-id header).
+
+class _ForwardedResponse(Response):
+    """
+    No-op ASGI response: signals that the forwarded-to MCP app already sent
+    the real response. Subclassing Response keeps FastAPI from trying to
+    JSON-encode the return value; overriding ``__call__`` stops it from
+    emitting a second http.response.start on the wire.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(content=b"")
+
+    async def __call__(self, scope, receive, send):  # type: ignore[override]
+        return None
+
+
+def _find_mounted_connector_app(app, connector_name: str):
+    """Return the ASGI app mounted at /mcp/{connector_name}, or None."""
+    from starlette.routing import Mount
+    mount_path = f"/mcp/{connector_name}"
+    for route in app.routes:
+        if isinstance(route, Mount) and route.path == mount_path:
+            return route.app
+    return None
+
+
+async def _forward_to_connector_mcp(request: Request, user_id: str, connector_name: str):
+    """
+    Bridge the current request into the mounted connector MCP server.
+
+    Returns a _ForwardedResponse when the downstream app produced the response
+    (the normal case), or a JSONResponse for local error conditions (unknown
+    connector).
+    """
+    from fastapi.responses import JSONResponse
+
+    mounted_app = _find_mounted_connector_app(request.app, connector_name)
+    if mounted_app is None:
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"Connector MCP server not mounted: {connector_name}"},
+        )
+
+    # Modify scope: replace /user-mcp/... with /mcp so the mounted server sees
+    # its own route.
+    scope = dict(request.scope)
+    scope["path"] = "/mcp"
+
+    # Add user_id header for the MCP server to use
+    new_headers = [(k, v) for k, v in scope.get("headers", [])]
+    new_headers.append((b"x-user-id", user_id.encode()))
+    scope["headers"] = new_headers
+
+    await mounted_app(scope, request.receive, request._send)
+    return _ForwardedResponse()
+
+
+_LEGACY_PATH_KEYS_ENV = "RELAY_LEGACY_PATH_KEYS"
+
+
+def _legacy_path_keys_enabled() -> bool:
+    """Whether the credential-in-URL-path MCP route may serve requests."""
+    return os.getenv(_LEGACY_PATH_KEYS_ENV, "").strip().lower() in ("1", "true", "yes")
+
+
 @app.api_route("/user-mcp/{api_key}/{connector_name}/mcp", methods=["GET", "POST"], tags=["MCP Compatible"])
 async def per_user_mcp_endpoint(
     api_key: str,
@@ -2821,53 +2893,92 @@ async def per_user_mcp_endpoint(
     request: Request,
 ):
     """
-    Per-user MCP endpoint using API key authentication.
-    
-    The API key is in the URL path, identifying the user.
-    Forwards to the pre-mounted MCP server at /mcp/{connector_name}.
-    
-    Example: /user-mcp/relay_abc123/github/mcp
+    DEPRECATED legacy per-user MCP endpoint (API key in URL path).
+
+    Disabled by default. Set ``RELAY_LEGACY_PATH_KEYS=1`` to re-enable while
+    migrating clients to the header-authenticated route:
+
+        POST /user-mcp/{connector}/mcp
+        Authorization: Bearer relay_...
+
+    Bearer-equivalent credentials in URL paths leak into access logs, proxies,
+    and browser history; this route exists only as a migration aid.
     """
+    if not _legacy_path_keys_enabled():
+        logger.warning(
+            "Legacy path-key MCP endpoint is disabled; set RELAY_LEGACY_PATH_KEYS=1 "
+            "to enable. Clients should migrate to /user-mcp/{connector}/mcp with "
+            "an Authorization header."
+        )
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": (
+                    "This endpoint is disabled. Use /user-mcp/{connector}/mcp with "
+                    "'Authorization: Bearer <api_key>' instead. (Legacy path-key "
+                    "routes are gated behind RELAY_LEGACY_PATH_KEYS=1.)"
+                )
+            },
+        )
+
+    logger.warning(
+        "DEPRECATED: /user-mcp/{api_key}/... places credentials in URL paths "
+        "(access logs, proxies, history). Migrate to /user-mcp/%s/mcp with an "
+        "Authorization header.",
+        connector_name,
+    )
+
     from auth.database import get_api_key, update_api_key_last_used
-    
+
     # Validate API key
     key_data = get_api_key(api_key)
     if not key_data:
         return JSONResponse(status_code=401, content={"error": "Invalid API key"})
-    
+
     user_id = key_data["user_id"]
-    
+
     # Update last used
     update_api_key_last_used(api_key)
-    
-    # Find the mounted connector MCP server
-    mount_path = f"/mcp/{connector_name}"
-    mounted_app = None
-    
-    # Routes are of type Mount for mounted apps
-    from starlette.routing import Mount
-    for route in app.routes:
-        if isinstance(route, Mount) and route.path == mount_path:
-            mounted_app = route.app
-            break
-    
-    if mounted_app is None:
-        return JSONResponse(status_code=404, content={"error": f"Connector MCP server not mounted: {connector_name}"})
-    
-    # Modify scope: replace /user-mcp/{api_key}/{connector}/mcp with /mcp
-    scope = dict(request.scope)
-    scope["path"] = "/mcp"
-    
-    # Add user_id header for the MCP server to use
-    new_headers = [(k, v) for k, v in scope.get("headers", [])]
-    new_headers.append((b"x-user-id", user_id.encode()))
-    scope["headers"] = new_headers
-    
-    # Forward to the mounted MCP server
-    await mounted_app(scope, request.receive, request._send)
-    
-    # Return empty response (the ASGI app has already sent the response)
-    return Response(content="")
+
+    return await _forward_to_connector_mcp(request, user_id, connector_name)
+
+
+@app.api_route("/user-mcp/{connector_name}/mcp", methods=["GET", "POST"], tags=["MCP Compatible"])
+async def per_user_mcp_header_endpoint(
+    connector_name: str,
+    request: Request,
+):
+    """
+    Per-user MCP endpoint with the API key in the Authorization header.
+
+    Example:
+
+        curl -X POST https://gateway/user-mcp/github/mcp \\
+          -H "Authorization: Bearer relay_abc123" \\
+          -H "Content-Type: application/json" \\
+          -d '{"jsonrpc":"2.0","method":"tools/list","id":1}'
+    """
+    from auth.database import get_api_key, update_api_key_last_used
+
+    authorization = request.headers.get("Authorization") or ""
+    token = authorization[7:] if authorization.startswith("Bearer ") else authorization.strip()
+    if not token:
+        return JSONResponse(status_code=401, content={"error": "Missing API key"})
+
+    # Only DB-backed API keys are accepted here (relay_...); OAuth bearer
+    # tokens belong on /mcp/{connector}.
+    if not token.startswith("relay_"):
+        return JSONResponse(status_code=401, content={"error": "Invalid API key"})
+
+    key_data = get_api_key(token)
+    if not key_data:
+        return JSONResponse(status_code=401, content={"error": "Invalid API key"})
+
+    user_id = key_data["user_id"]
+    update_api_key_last_used(token)
+
+    return await _forward_to_connector_mcp(request, user_id, connector_name)
+
 
 
 @app.post("/mcp/connectors/{connector_name}/health", tags=["MCP Compatible"])

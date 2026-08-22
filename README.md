@@ -94,13 +94,18 @@ Visit http://localhost:8000/auth/register to create a user account. You'll autom
 
 ### 6. Connect MCP Clients
 
-Each connector has a unique MCP endpoint using your API key:
+Each connector has a unique MCP endpoint authenticated with your API key via
+the Authorization header (keeps the key out of URL paths, which leak into
+access logs and browser history):
 
 ```json
 {
   "mcpServers": {
     "relay-github": {
-      "url": "http://localhost:8000/user-mcp/{api_key}/github/mcp"
+      "url": "http://localhost:8000/user-mcp/github/mcp",
+      "headers": {
+        "Authorization": "Bearer relay_your-api-key"
+      }
     }
   }
 }
@@ -265,10 +270,12 @@ curl -X POST http://localhost:8000/v1/batch \
 
 ### Per-User MCP Endpoints
 
-Each user has their own MCP endpoint with the API key in the URL path:
+Each user gets per-connector MCP endpoints authenticated with an API key in
+the Authorization header (the key never appears in the URL):
 
 ```
-http://localhost:8000/user-mcp/{api_key}/{connector_name}/mcp
+http://localhost:8000/user-mcp/{connector_name}/mcp
+Authorization: Bearer relay_<your-api-key>
 ```
 
 This allows MCP clients like Cursor, Claude Code, Gemini CLI, and OpenCode to connect without OAuth dance.
@@ -277,12 +284,18 @@ This allows MCP clients like Cursor, Claude Code, Gemini CLI, and OpenCode to co
 
 | Client | Configuration |
 |--------|--------------|
-| Claude Code | `{"url": "http://localhost:8000/user-mcp/{api_key}/github/mcp"}` |
-| Cursor | `{"url": "http://localhost:8000/user-mcp/{api_key}/github/mcp"}` |
-| Gemini CLI | `url: http://localhost:8000/user-mcp/{api_key}/github/mcp` |
-| OpenCode | `{"url": "http://localhost:8000/user-mcp/{api_key}/github/mcp"}` |
+| Claude Code | `{"url": "http://localhost:8000/user-mcp/github/mcp", "headers": {"Authorization": "Bearer relay_..."}}` |
+| Cursor | `{"url": "http://localhost:8000/user-mcp/github/mcp", "headers": {"Authorization": "Bearer relay_..."}}` |
+| Gemini CLI | `url: http://localhost:8000/user-mcp/github/mcp` + `Authorization: Bearer relay_...` header |
+| OpenCode | `{"url": "http://localhost:8000/user-mcp/github/mcp", "headers": {"Authorization": "Bearer relay_..."}}` |
 
 The connector detail page (e.g., `/connectors/github`) provides ready-to-copy configurations for each client.
+
+> **Migrating from the legacy path-key URLs?**
+> The old `user-mcp/{api_key}/{connector}/mcp` endpoints put bearer-equivalent
+> credentials in URL paths, where they leak into access logs, proxies, and
+> browser history. They are disabled by default (enable temporarily with
+> `RELAY_LEGACY_PATH_KEYS=1`) — see [docs/MIGRATION_PATH_KEYS.md](docs/MIGRATION_PATH_KEYS.md).
 
 ### MCP Resources
 

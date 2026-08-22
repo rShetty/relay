@@ -642,6 +642,11 @@ def create_user(
             "is_admin": is_admin,
         }
     except sqlite3.IntegrityError:
+        # Roll back and close so the failed INSERT's write transaction does
+        # not hold the database lock for the rest of the process (every later
+        # write would fail with "database is locked").
+        conn.rollback()
+        conn.close()
         return None
 
 

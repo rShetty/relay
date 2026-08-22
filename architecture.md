@@ -6,7 +6,7 @@
 
 **Key Features:**
 - Multi-user system with signup/login and API keys
-- Per-user MCP endpoints (`/user-mcp/{api_key}/{connector}/mcp`) for direct client connections
+- Per-user MCP endpoints (`/user-mcp/{connector}/mcp` with Authorization header) for direct client connections
 - Per-user token isolation - each user's third-party tokens are stored separately
 - Dynamic tool discovery from all connectors at startup
 - MCP Resources and Prompts from each connector
@@ -31,18 +31,18 @@
 │                              │      • Web UI                   │                   │
 │                              │      • REST API                 │                   │
 │                              │      • Per-user MCP:            │                   │
-│                              │        /user-mcp/{key}/{conn}/mcp│                   │
+│                              │        /user-mcp/{conn}/mcp      │                   │
 │                              └─────────────────────────────────┘                   │
 └─────────────────────────────────────────────────────────────────────────────────────┘
                     │                                                  │
-                    │ Per-User MCP (API key in URL)                  │ 3rd Party Tokens
+                    │ Per-User MCP (API key via Authorization header)                  │ 3rd Party Tokens
                     ▼                                                  ▼
 ┌─────────────────────────────┐              ┌─────────────────────────────────────┐
 │      MCP Client             │              │         Third-Party APIs           │
 │                             │              │                                     │
 │  • OpenCode ───────────────┼──────────────┼──► GitHub API                       │
 │  • Claude Code              │  /user-mcp/  │  • Slack API                       │
-│  • Cursor                   │  {api_key}/  │  • Linear API                      │
+│  • Cursor                   │  Bearer key  │  • Linear API                      │
 │  • Gemini CLI              │  {conn}/mcp  │  • OpenAI API                      │
 │                             │              │  • Anthropic API                    │
 └─────────────────────────────┘              └─────────────────────────────────────┘
@@ -76,14 +76,16 @@ Connectors are integrations with third-party services. Each connector:
 
 ### 3. Per-User MCP Endpoints
 
-Each user gets a unique MCP endpoint that includes their API key in the URL path:
+Each user gets per-connector MCP endpoints authenticated with an API key in
+the Authorization header:
 
 ```
-/user-mcp/{api_key}/{connector_name}/mcp
+/user-mcp/{connector_name}/mcp
+Authorization: Bearer relay_<api_key>
 ```
 
 This endpoint:
-1. Validates the API key from the URL
+1. Validates the API key from the Authorization header
 2. Looks up the user ID associated with the API key
 3. Forwards the request to the mounted MCP server at `/mcp/{connector}`
 4. Passes the user ID via `X-User-Id` header
@@ -144,7 +146,7 @@ The token store manages two types of tokens:
 For MCP clients that don't want OAuth dance, use per-user MCP endpoints:
 
 ```
-/user-mcp/{api_key}/{connector}/mcp
+/user-mcp/{connector}/mcp   (Authorization: Bearer relay_<api_key>)
 ```
 
 ```
