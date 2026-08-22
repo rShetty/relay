@@ -149,7 +149,7 @@ class RedisTokenStore(AbstractTokenStore):
 
     async def _get_client(self) -> Any:
         if self._client is None:
-            import redis.asyncio as aioredis  # type: ignore[import]
+            import redis.asyncio as aioredis
             self._client = await aioredis.from_url(
                 self._redis_url, decode_responses=True
             )

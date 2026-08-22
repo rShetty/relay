@@ -338,7 +338,7 @@ def get_config(force_reload: bool = False) -> RelayConfig:
     """
     global _config_cache
     if _config_cache is None or force_reload:
-        _config_cache = RelayConfig(_env_file=".env")
+        _config_cache = RelayConfig()  # env auto-loaded by pydantic-settings
     return _config_cache
 
 

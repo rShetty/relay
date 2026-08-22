@@ -439,7 +439,7 @@ class AuditLogger:
             if key.lower() in self.sensitive_fields:
                 result[key] = "[REDACTED]"
             elif isinstance(value, dict):
-                result[key] = self._redact(value)
+                result[key] = self._redact(value)  # type: ignore[assignment]
             else:
                 result[key] = value
         return result
