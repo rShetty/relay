@@ -110,6 +110,12 @@ class BackendState:
     circuit_state: CircuitState = CircuitState.CLOSED
     circuit_opened_at: Optional[datetime] = None
 
+    # True once a connection attempt has ever been made. Backends that were
+    # never attempted (optional integrations shipped without credentials, or
+    # MCP runtimes not installed in the container) are excluded from
+    # readiness accounting — see /ready in gateway/server.py.
+    has_connected: bool = False
+
 
 # -----------------------------------------------------------------------------
 # MCP Backend Handler
@@ -398,15 +404,22 @@ class APIBackendHandler:
         json_data: Optional[Dict[str, Any]] = None,
         params: Optional[Dict[str, Any]] = None,
         timeout: int = 120,
+        client_errors_ok: bool = False,
     ) -> Tuple[bool, Any]:
         """
         Make a REST API call.
-        
+
+        When ``client_errors_ok`` is True (used by health-check pings), any
+        completed HTTP response below 500 counts as success: a 401/403/404
+        from an authenticated API proves the endpoint is reachable, which is
+        the signal liveness probing cares about. Tool-call behaviour
+        (default) is unchanged: >=400 is an error.
+
         Returns:
             (success, result_or_error)
         """
         client = await self.get_client(backend_id, base_url, headers)
-        
+
         try:
             async with asyncio.timeout(timeout):
                 response = await client.request(
@@ -415,8 +428,13 @@ class APIBackendHandler:
                     json=json_data,
                     params=params,
                 )
-                
-                if response.status_code >= 400:
+
+                if response.status_code >= 500:
+                    return False, {
+                        "error": f"API error {response.status_code}",
+                        "body": response.text[:500],
+                    }
+                if response.status_code >= 400 and not client_errors_ok:
                     return False, {
                         "error": f"API error {response.status_code}",
                         "body": response.text[:500],
@@ -611,6 +629,7 @@ class BackendManager:
                 "tools": bstate.definition.tools,
                 "requires_auth": bstate.definition.requires_auth,
                 "last_error": bstate.last_error,
+                "has_connected": bstate.has_connected,
                 "circuit_breaker": circuit_info,
                 "stats": {
                     "total_requests": bstate.total_requests,
@@ -702,6 +721,7 @@ class BackendManager:
         
         latency_ms = (time.time() - start_time) * 1000
         state.avg_latency_ms = latency_ms
+        state.has_connected = True
         
         if success:
             state.status = BackendStatus.HEALTHY
@@ -1036,6 +1056,14 @@ class BackendManager:
             if not bstate.definition.enabled:
                 continue
 
+            # Backends that were never successfully/attemptedly connected
+            # (optional integrations without credentials, MCP runtimes not
+            # installed in the container, self-referential dev URLs) are
+            # left in DISCONNECTED without accumulating failures or tripping
+            # circuit breakers — they are excluded from readiness instead.
+            if not bstate.has_connected:
+                continue
+
             # MCP backends: try to list tools
             if bstate.definition.backend_type in (BackendType.MCP_STDIO, BackendType.MCP_HTTP):
                 success, tools = await self._mcp_handler.list_tools(backend_id)
@@ -1068,6 +1096,7 @@ class BackendManager:
                         method="GET",
                         endpoint="",
                         timeout=10,
+                        client_errors_ok=True,
                     )
                     if success:
                         bstate.status = BackendStatus.HEALTHY

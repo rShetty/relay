@@ -145,8 +145,11 @@ class TestReadinessDegradation:
         )
         app_state.backends.register_backend(definition)
         try:
-            # Force the circuit breaker open so the backend is not ready.
+            # Mark the backend as attempted, then force the circuit breaker
+            # open so the backend is not ready. A never-attempted backend is
+            # excluded from readiness entirely (tested below).
             state = app_state.backends.get_backend(definition.id)
+            state.has_connected = True
             state.circuit_state = CircuitState.OPEN
             state.circuit_opened_at = None
 
@@ -156,6 +159,31 @@ class TestReadinessDegradation:
             assert body["ready"] is False
             assert "backends" in body["degraded"]
             assert body["checks"]["backends"]["circuit_open"] >= 1
+        finally:
+            app_state.backends.unregister_backend(definition.id)
+
+    def test_never_connected_backends_do_not_degrade_readiness(self, readiness_client):
+        """Optional backends without credentials/runtime stay DISCONNECTED and
+        must not fail /ready — they are not backing services."""
+        from backends.manager import BackendDefinition, BackendType
+
+        client, app_state = readiness_client
+        definition = BackendDefinition(
+            id="optional_never_connected",
+            name="optional_never_connected",
+            description="never attempted optional integration",
+            backend_type=BackendType.MCP_STDIO,
+            tools=[],
+        )
+        app_state.backends.register_backend(definition)
+        try:
+            resp = client.get("/ready")
+            assert resp.status_code == 200
+            body = resp.json()
+            assert body["ready"] is True
+            checks = body["checks"]["backends"]
+            assert checks["total"] == 1          # still visible for operators
+            assert checks["attempted"] == 0      # but excluded from the gate
         finally:
             app_state.backends.unregister_backend(definition.id)
 

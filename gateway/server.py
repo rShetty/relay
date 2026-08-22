@@ -2308,17 +2308,30 @@ async def readiness():
     checks: Dict[str, Dict[str, Any]] = {}
 
     # --- Backends ---------------------------------------------------------
+    # Backends that were never connected (optional integrations shipped
+    # without credentials, MCP runtimes not installed, self-referential dev
+    # URLs) are not counted against readiness: they are optional capacity,
+    # not backing services. Readiness reflects what Relay depends on to
+    # serve traffic — SQLite, Redis and any backend actually in use.
     backends_info = app_state.backends.list_backends()
-    backends_healthy = sum(1 for b in backends_info if b["status"] == "healthy")
+    attempted = [b for b in backends_info if b.get("has_connected", False)]
+    backends_healthy = sum(
+        1 for b in attempted if b["status"] == "healthy"
+    )
     backends_total = len(backends_info)
     circuit_open = sum(
-        1 for b in backends_info
+        1 for b in attempted
         if b.get("circuit_breaker", {}).get("state") == "open"
     )
     checks["backends"] = {
-        "ok": backends_total == 0 or (backends_healthy > 0 and circuit_open == 0),
+        "ok": (
+            backends_total == 0
+            or len(attempted) == 0
+            or (backends_healthy > 0 and circuit_open == 0)
+        ),
         "healthy": backends_healthy,
         "total": backends_total,
+        "attempted": len(attempted),
         "circuit_open": circuit_open,
     }
 
