@@ -1551,10 +1551,13 @@ async def disconnect_connector(connector_name: str, request: Request):
         return RedirectResponse(url="/auth/login")
 
     await get_token_store().delete_token(user["id"], connector_name)
-    # CodeQL #8: connector_name is a path segment — percent-encode it so a
-    # crafted value can't alter the redirect target structure.
-    from urllib.parse import quote as _q
-    return RedirectResponse(url=f"/connectors/{_q(connector_name, safe='')}", status_code=303)
+    # CodeQL #8/#9: validate the path segment against the connector naming
+    # scheme BEFORE building the redirect — allowlisted characters only,
+    # so the Location target is provably intra-site.
+    import re as _re
+    if not _re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", connector_name):
+        raise HTTPException(status_code=400, detail="Invalid connector name")
+    return RedirectResponse(url=f"/connectors/{connector_name}", status_code=303)
 
 
 @app.get("/connectors/{connector_name}", tags=["Web UI"])
