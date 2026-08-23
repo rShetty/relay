@@ -186,6 +186,12 @@ jobs:
       IMAGE_REPO: ${{ needs.image.outputs.image_repo }}
       IMAGE_DIGEST: ${{ needs.image.outputs.image_digest }}
     steps:
+      - name: Connect to tailnet
+        uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:hostinger
       - name: Deploy promoted image via SSH
         uses: appleboy/ssh-action@v1
         with:
