@@ -616,7 +616,7 @@ mypy --ignore-missing-imports gateway/ auth/ security/ config/
 
 ## Ecosystem
 
-Relay is part of a six-project AI governance ecosystem for enterprises:
+Relay is part of the AI governance ecosystem governed through Governance Hub:
 
 | Project | Role | Repo |
 |---|---|---|
@@ -626,6 +626,9 @@ Relay is part of a six-project AI governance ecosystem for enterprises:
 | **Miser** | LLM cost optimization | [rShetty/miser](https://github.com/rShetty/miser) |
 | **Sentiel** | Observability, DLP & compliance | [rShetty/sentiel](https://github.com/rShetty/sentiel) |
 | **Aegis** | Network egress & attestation | [rShetty/Aegis](https://github.com/rShetty/Aegis) |
+| **Argus** | Human/agent OIDC identity provider | [rShetty/argus](https://github.com/rShetty/argus) |
+| **Forge** | Supply chain trust & package signing | [rShetty/forge](https://github.com/rShetty/forge) |
+| **Governance Hub** | Unified admin console and sole product UI | [rShetty/governance-hub](https://github.com/rShetty/governance-hub) |
 
 Relay integrates with Patroclus for per-tool authorization: before every MCP
 `tools/call`, Relay checks with Patroclus to verify the agent is allowed to

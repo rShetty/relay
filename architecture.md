@@ -2,10 +2,12 @@
 
 ## Overview
 
-**Relay** is an OAuth 2.1-authenticated MCP proxy that enables AI coding clients (OpenCode, Claude Code, Cursor, Gemini CLI) to access third-party services (GitHub, Slack, Linear, OpenAI, Anthropic) through a unified interface.
+**Relay** is an OAuth 2.1-authenticated MCP gateway that enables AI coding clients (OpenCode, Claude Code, Cursor, Gemini CLI) to access third-party services (GitHub, Slack, Linear, OpenAI, Anthropic) and external MCP servers through a unified interface.
 
 **Key Features:**
 - Multi-user system with signup/login and API keys
+- Stateless JSON Streamable HTTP transport by default
+- Federated search across every registered connector and external MCP backend
 - Per-user MCP endpoints (`/user-mcp/{connector}/mcp` with Authorization header) for direct client connections
 - Per-user token isolation - each user's third-party tokens are stored separately
 - Dynamic tool discovery from all connectors at startup
@@ -317,6 +319,20 @@ When the third-party token expires (e.g., GitHub token):
 
 ## MCP Server Authentication
 
+### Stateless Transport
+
+Relay's MCP servers use the Streamable HTTP transport in **stateless JSON
+mode** by default. Each HTTP request creates a fresh transport, and responses
+are JSON rather than long-lived SSE streams. This is the preferred deployment
+profile for a horizontally scaled gateway behind a reverse proxy.
+
+Operators can revert to stateful SSE with:
+
+```bash
+SERVER_MCP_STATELESS=false
+SERVER_MCP_JSON_RESPONSE=false
+```
+
 ### FastMCP-based MCP Server
 
 The gateway includes an MCP server implemented with `mcp.server.fastmcp.FastMCP`. This runs in stdio mode for clients like OpenCode.
@@ -335,6 +351,7 @@ The gateway includes an MCP server implemented with `mcp.server.fastmcp.FastMCP`
 |------|---------|
 | `gateway_list_backends` | List available MCP backends |
 | `gateway_list_tools` | List all available tools (connectors + backends) |
+| `gateway_search_tools` | Federated search across connectors and MCP backends |
 | `gateway_connect_backend` | Connect to a backend |
 | `gateway_auth_status` | Check user's auth and connected services |
 | `gateway_call_tool` | Call any tool with proper auth |
@@ -415,6 +432,7 @@ gateway_call_tool(
 | Endpoint | Method | Auth | Purpose |
 |----------|--------|------|---------|
 | `/mcp/tools` | GET | JWT | List MCP tools |
+| `/mcp/search?q=` | GET | JWT | Search all connector/backend tools |
 | `/mcp/call` | POST | JWT | Call MCP tool |
 | `/mcp/backends` | GET | JWT | List backends |
 
@@ -916,7 +934,7 @@ class AuditLogger:
 | **Audit Logging** | ✅ Done | Tool calls logged to file |
 | **Input Validation** | ✅ Done | Sanitization + max sizes |
 | **MCP Server (stdio)** | ✅ Done | FastMCP with auth tools |
-| **Protocol Mediation** | ⚠️ Partial | stdio only, need SSE/streamable-http |
+| **Protocol Mediation** | ✅ Done | Stateless JSON Streamable HTTP + stdio compatibility |
 | **Credential Vault** | ⚠️ Basic | SQLite, no encryption |
 | **Multi-tenant Isolation** | ✅ Done | Per-user tokens |
 | **Access Control (RBAC)** | ⚠️ Basic | Client scopes |
@@ -928,9 +946,18 @@ class AuditLogger:
 
 ### High Priority
 
-1. **SSE/Streamable-HTTP for MCP** - Enable remote MCP clients
-2. **Token Encryption** - Encrypt stored third-party tokens at rest
-3. **Better Error Handling** - Token expiry detection and re-auth flow
+1. **Token Encryption** - Encrypt stored third-party tokens at rest
+2. **Better Error Handling** - Token expiry detection and re-auth flow
+
+## Current Integration Model
+
+- Governance Hub is the unified admin console and sole product UI.
+- Argus provides OIDC identity with RFC 7591 dynamic client registration and
+  pre-registered CIMD clients.
+- Hive and Relay support MCP server installation with CIMD credentials first,
+  then DCR fallback for providers that advertise a registration endpoint.
+- Relay's federated search tool searches all connector and backend tools from
+  one authenticated interface before dispatching `gateway_call_tool`.
 
 ### Medium Priority
 
