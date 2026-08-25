@@ -214,6 +214,8 @@ class ServerSettings(BaseSettings):
     # MCP Server info
     server_name: str = "relay"
     server_version: str = "0.1.0"
+    mcp_stateless: bool = True
+    mcp_json_response: bool = True
     server_instructions: str = (
         "Relay - OAuth-authenticated proxy for connecting to "
         "third-party MCP servers and APIs. Use tools to discover "

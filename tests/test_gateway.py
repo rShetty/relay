@@ -106,6 +106,80 @@ class TestPKCE:
 
 
 # ===========================================================================
+# Stateless MCP transport + federated search (new)
+# ===========================================================================
+
+class TestStatelessMCPConfiguration:
+    """Relay's MCP endpoints must default to stateless JSON transport."""
+
+    def test_default_server_settings_enable_stateless_json(self):
+        from config.settings import ServerSettings
+
+        settings = ServerSettings()
+        assert settings.mcp_stateless is True
+        assert settings.mcp_json_response is True
+
+    def test_create_connector_mcp_uses_stateless_transport(self, monkeypatch):
+        pytest.importorskip("mcp.server.fastmcp")
+        from gateway import server as srv
+        from config.settings import RelayConfig
+
+        captured = {}
+
+        class FakeFastMCP:
+            def __init__(self, name, instructions=None, **kwargs):
+                captured.update(kwargs)
+
+            def tool(self):
+                return lambda function: function
+
+            def resource(self, uri):
+                return lambda function: function
+
+            def prompt(self, name=None):
+                return lambda function: function
+
+        class FakeTool:
+            name = "list_issues"
+            description = "List issues"
+            parameters = {}
+            requires_auth = False
+
+        class FakeConnector:
+            display_name = "GitHub"
+            description = "GitHub"
+
+            def get_tools(self):
+                return [FakeTool()]
+
+            def get_resources(self):
+                return []
+
+            def get_prompts(self):
+                return []
+
+        class FakeAppState:
+            config = RelayConfig()
+            patroclus = None
+            connectors = type(
+                "Registry",
+                (),
+                {"get_connector": staticmethod(lambda name: FakeConnector())},
+            )
+
+        import mcp.server.fastmcp as fastmcp_module
+        original_fastmcp = fastmcp_module.FastMCP
+        fastmcp_module.FastMCP = FakeFastMCP
+        try:
+            srv.create_connector_mcp_server("github", FakeAppState())
+        finally:
+            fastmcp_module.FastMCP = original_fastmcp
+
+        assert captured["stateless_http"] is True
+        assert captured["json_response"] is True
+
+
+# ===========================================================================
 # JWT Manager Tests (existing + Redis extension)
 # ===========================================================================
 

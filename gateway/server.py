@@ -2475,6 +2475,40 @@ async def list_tools(user: Dict = Depends(get_current_user)):
     }
 
 
+@app.get("/mcp/search", tags=["MCP Compatible"])
+async def search_tools(
+    q: str,
+    limit: int = 20,
+    user: Dict = Depends(get_current_user),
+):
+    """Search all backend and connector tools through one federated interface."""
+    terms = [term.lower() for term in q.split() if term.strip()]
+    if not terms:
+        return {"query": q, "results": [], "total": 0}
+
+    candidates = []
+    for tool in state.backends.list_tools():
+        text = " ".join(str(tool.get(key, "")) for key in ("name", "backend_id", "backend_name")).lower()
+        score = sum(term in text for term in terms)
+        if score:
+            candidates.append({**tool, "source": "gateway_call_tool", "score": score})
+
+    for tool in state.connectors.get_all_tools():
+        text = " ".join(str(tool.get(key, "")) for key in ("name", "description", "connector")).lower()
+        score = sum(term in text for term in terms)
+        if score:
+            candidates.append({
+                **tool,
+                "inputSchema": {"type": "object", **tool.get("parameters", {})},
+                "source": f"connector:{tool.get('connector')}",
+                "score": score,
+            })
+
+    candidates.sort(key=lambda item: (-item["score"], item["name"]))
+    results = candidates[:max(1, min(limit, 100))]
+    return {"query": q, "results": results, "total": len(results)}
+
+
 # -----------------------------------------------------------------------------
 # Public Discovery Endpoints (No Auth Required)
 # -----------------------------------------------------------------------------
@@ -3710,6 +3744,8 @@ def create_mcp_server(app_state: Optional["AppState"] = None, init_state: bool =
         streamable_http_path="/mcp",
         sse_path="/sse",
         message_path="/messages/",
+        json_response=config.server.mcp_json_response,
+        stateless_http=config.server.mcp_stateless,
     )
     
     async def _validate_auth(authorization: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -3806,7 +3842,58 @@ def create_mcp_server(app_state: Optional["AppState"] = None, init_state: bool =
             return json.dumps({"error": "Invalid or missing authorization"})
         backend_tools = app_state.backends.list_tools()
         connector_tools = app_state.connectors.get_all_tools()
-        return json.dumps({"backend_tools": backend_tools, "connector_tools": connector_tools}, indent=2)
+        return json.dumps({
+            "backend_tools": [
+                {**tool, "source": "mcp_backend"}
+                for tool in backend_tools
+            ],
+            "connector_tools": connector_tools,
+        }, indent=2)
+
+    @mcp.tool()
+    async def gateway_search_tools(
+        query: str,
+        authorization: Optional[str] = None,
+    ) -> str:
+        """Search every registered backend and connector tool from one interface.
+
+        Results include the source needed by ``gateway_call_tool``. Call the
+        returned tool through that dispatcher after selecting a result.
+        """
+        user_info = await _validate_auth(authorization)
+        if not user_info:
+            return json.dumps({"error": "Invalid or missing authorization"})
+
+        terms = [term.lower() for term in query.split() if term.strip()]
+        if not terms:
+            return json.dumps({"query": query, "results": [], "total": 0})
+
+        candidates = []
+        for tool in app_state.backends.list_tools():
+            text = " ".join(str(tool.get(key, "")) for key in ("name", "description", "backend_id", "backend_name")).lower()
+            score = sum(1 for term in terms if term in text)
+            if score:
+                candidates.append({
+                    **tool,
+                    "source": "gateway_call_tool",
+                    "score": score,
+                })
+
+        for tool in app_state.connectors.get_all_tools():
+            text = " ".join(str(tool.get(key, "")) for key in ("name", "description", "connector")).lower()
+            score = sum(1 for term in terms if term in text)
+            if score:
+                candidates.append({
+                    **tool,
+                    "inputSchema": {"type": "object", **tool.get("parameters", {})},
+                    "source": f"connector:{tool.get('connector')}",
+                    "dispatcher": "connector",
+                    "score": score,
+                })
+
+        candidates.sort(key=lambda item: (-item["score"], item["name"]))
+        results = candidates[:20]
+        return json.dumps({"query": query, "results": results, "total": len(results)}, indent=2)
 
     @mcp.tool()
     async def gateway_connect_backend(backend_id: str, authorization: Optional[str] = None) -> str:
@@ -3918,6 +4005,8 @@ def create_connector_mcp_server(
     mcp = FastMCP(
         f"gateway-{connector_name}",
         instructions=f"{connector.display_name}: {connector.description}",
+        json_response=app_state.config.server.mcp_json_response,
+        stateless_http=app_state.config.server.mcp_stateless,
     )
 
 
@@ -4156,6 +4245,8 @@ def create_connector_mcp_server_with_auth(
     mcp = FastMCP(
         f"gateway-{connector_name}",
         instructions=f"{connector.display_name}: {connector.description}",
+        json_response=app_state.config.server.mcp_json_response,
+        stateless_http=app_state.config.server.mcp_stateless,
     )
     for tool_def in tools:
         tool_fn = _build_mcp_tool_handler(
@@ -4224,6 +4315,8 @@ def create_connector_mcp_server_with_auth(
     mcp = FastMCP(
         f"relay-{connector_name}",
         instructions=f"Relay proxying to {connector_name} connector",
+        json_response=get_config().server.mcp_json_response,
+        stateless_http=get_config().server.mcp_stateless,
     )
 
     @mcp.tool()
