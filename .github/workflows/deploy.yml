@@ -263,6 +263,21 @@ jobs:
             docker compose -f docker-compose.prod.yml down
             docker compose -f docker-compose.prod.yml up -d --no-build
 
+            # ── Production cutover: tailnet-only nginx vhost ──────────
+            # Operator UI routes restricted to the Tailscale tailnet; API
+            # endpoints stay reachable (see deploy/nginx-vhost.conf).
+            if [ -f deploy/nginx-vhost.conf ] && [ -d /etc/nginx/sites-available ]; then
+              install -m 644 deploy/nginx-vhost.conf /etc/nginx/sites-available/relay.conf
+              ln -sf /etc/nginx/sites-available/relay.conf /etc/nginx/sites-enabled/relay.conf
+              if nginx -t 2>/tmp/nginx-test.log; then
+                systemctl reload nginx
+                echo "nginx vhost installed and reloaded"
+              else
+                echo "WARNING: nginx -t failed; vhost staged but NOT reloaded:" >&2
+                cat /tmp/nginx-test.log >&2 || true
+              fi
+            fi
+
             # ── Health check with retries ────────────────────────────
             sleep 10
             for i in 1 2 3 4 5 6; do
