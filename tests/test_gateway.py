@@ -1613,6 +1613,12 @@ class TestConnectorMcpRegistration:
 
         class FakeAppState:
             patroclus = None
+
+            class config:
+                class server:
+                    mcp_stateless = False
+                    mcp_json_response = False
+
             class connectors:
                 @staticmethod
                 def get_connector(name):
@@ -1621,7 +1627,7 @@ class TestConnectorMcpRegistration:
         # Monkeypatch FastMCP used inside the function under test.
         import mcp.server.fastmcp as fastmcp_mod
         orig_fastmcp = fastmcp_mod.FastMCP
-        fastmcp_mod.FastMCP = lambda name, instructions=None: registry
+        fastmcp_mod.FastMCP = lambda name, instructions=None, **kwargs: registry
         try:
             result = srv.create_connector_mcp_server("github", FakeAppState())
         finally:
