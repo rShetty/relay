@@ -4180,7 +4180,13 @@ def _build_mcp_tool_handler(
         return json.dumps({"result": enforced})
 
     sig_params = []
-    for pname in param_names:
+    # inspect.Signature requires non-default parameters before default ones.
+    # Connector tools can interleave required and optional params, so order
+    # required first (the handler itself is **kwargs-based, so only the set
+    # of parameters matters, not their order).
+    for pname in [p for p in param_names if p in required] + [
+        p for p in param_names if p not in required
+    ]:
         annotation = str if pname in required else Optional[str]
         default = inspect.Parameter.empty if pname in required else None
         sig_params.append(
